@@ -66,7 +66,7 @@
       <p class="zone-arrow"><code>git commit</code> ↓</p>
       <section class="zone zone-repo">
         <h3><span class="zone-num">3</span> Dépôt local <small>(.git)</small></h3>
-        <p class="zone-hint">L'historique enregistré : commits et branches.</p>
+        <p class="zone-hint">L'historique enregistré : commits, branches, tags et stash.</p>
         <div data-zone="repo"></div>
       </section>
       <p class="zone-arrow"><code>git push</code> ↓ · ↑ <code>git fetch</code> / <code>git pull</code></p>
@@ -104,14 +104,29 @@
         <ul class="help-list">
           <li><code>git init</code>, <code>git status</code>, <code>git add &lt;fichier&gt;</code> ou <code>git add .</code></li>
           <li><code>git commit -m "message"</code>, <code>git commit -am "message"</code></li>
-          <li><code>git log</code> (<code>--oneline</code>, <code>--graph</code>, <code>--all</code>), <code>git diff</code> (<code>--staged</code>)</li>
+          <li><code>git log</code> (<code>--oneline</code>, <code>--graph</code>, <code>--all</code>, <code>-- fichier</code>, <code>--merge</code>)</li>
+          <li><code>git diff</code> (<code>--staged</code>, <code>HEAD</code>, <code>main feature</code> pour comparer deux branches ; <code>--stat</code>, <code>--name-only</code>)</li>
           <li><code>git branch</code>, <code>git branch nom</code>, <code>git branch -d nom</code></li>
           <li><code>git checkout nom</code>, <code>git checkout -b nom</code>, <code>git switch nom</code>, <code>git switch -c nom</code></li>
           <li><code>git merge nom</code> (avance rapide, commit de fusion, conflits, <code>--abort</code>)</li>
           <li><code>git config --global user.name "Prénom Nom"</code>, <code>user.email</code>, <code>git config --list</code></li>
           <li><code>git help</code> et <code>git help &lt;commande&gt;</code> ; <code>help</code> pour l'aide en français</li>
         </ul>
-        <p class="help-note">reset, revert, cherry-pick, stash, tag et rebase sont prévus dans une prochaine version.</p>
+      </section>
+      <section>
+        <h3>Corriger, défaire, mettre de côté</h3>
+        <ul class="help-list">
+          <li><code>git commit --amend</code> (<code>-m "…"</code> ou <code>--no-edit</code>) remplace le dernier commit</li>
+          <li><code>git restore fichier</code> (<code>--staged</code>, <code>--source=HEAD~1</code>), <code>git rm fichier</code> (<code>--cached</code>)</li>
+          <li><code>git reset</code> <code>--soft</code> / <code>--mixed</code> / <code>--hard</code> <code>HEAD~1</code> ; <code>git reset fichier</code> désindexe</li>
+          <li><code>git revert commit</code> crée un commit qui annule un ancien commit (l'historique n'est pas réécrit)</li>
+          <li><code>git cherry-pick commit</code> copie un commit sur la branche courante (<code>-x</code>, <code>a..b</code>, <code>--continue</code>, <code>--abort</code>)</li>
+          <li><code>git rebase origin/main</code> rejoue vos commits par-dessus une autre branche (<code>--continue</code>, <code>--skip</code>, <code>--abort</code>)</li>
+          <li><code>git stash</code>, <code>git stash -u</code>, <code>git stash list</code>, <code>git stash pop</code>, <code>git stash apply</code>, <code>git stash drop</code></li>
+          <li><code>git tag v1.0</code>, <code>git tag -a v1.1 -m "…"</code>, <code>git tag -d v1.0</code>, <code>git push origin v1.0</code></li>
+          <li>Pendant un conflit : <code>git checkout --ours fichier</code> / <code>--theirs fichier</code> gardent un côté, <code>git log --merge</code> montre qui a changé quoi.</li>
+          <li><code>.gitignore</code> : créez-le avec <code>echo "*.log" &gt; .gitignore</code> ; les fichiers ignorés disparaissent de <code>git status</code> et de <code>git add .</code> (<code>git check-ignore -v fichier</code>).</li>
+        </ul>
       </section>
       <section>
         <h3>Travailler avec un dépôt distant</h3>
@@ -121,7 +136,8 @@
         <ul class="help-list">
           <li><code>git remote -v</code>, <code>git remote add origin &lt;url&gt;</code>, <code>git remote remove origin</code></li>
           <li><code>git push -u origin main</code> la première fois, puis <code>git push</code> ; <code>git push origin --delete nom</code></li>
-          <li><code>git fetch</code> télécharge sans fusionner ; <code>git pull</code> = fetch + merge (<code>--no-rebase</code>, <code>--ff-only</code>)</li>
+          <li><code>git fetch</code> télécharge sans fusionner ; <code>git pull</code> = fetch + merge (<code>--no-rebase</code>, <code>--ff-only</code>) ou fetch + rebase (<code>--rebase</code>)</li>
+          <li>Après un rebase ou un amend, le push est refusé : <code>git push --force-with-lease</code> (plus sûr que <code>-f</code>).</li>
           <li><code>git branch -a</code>, <code>git branch -vv</code> (branche suivie, avance et retard), <code>git checkout nom</code> crée la branche qui suit <code>origin/nom</code></li>
           <li><code>collab [branche] [fichier]</code> : Camille, une collègue simulée, pousse un commit sur le dépôt distant.</li>
           <li><code>mr &lt;branche&gt; [cible]</code> : votre merge request (pull request) est acceptée sur la forge, avec un commit de fusion.</li>

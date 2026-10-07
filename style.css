@@ -694,6 +694,23 @@ div.file-row .file-name::before {
   font-size: 0.9rem;
 }
 
+.repo-extra {
+  margin: 8px 0 0;
+  font-size: 0.9rem;
+}
+
+.repo-extra .branch-list {
+  margin-top: 4px;
+}
+
+.stash-entry {
+  display: flex;
+  gap: 8px;
+  align-items: baseline;
+  font-family: var(--mono);
+  font-size: 0.85rem;
+}
+
 .branch {
   display: grid;
   grid-template-columns: auto auto auto 1fr;

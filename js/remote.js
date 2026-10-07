@@ -27,6 +27,7 @@ import {
   requireRepo,
   success,
 } from './engine.js';
+import { rebase } from './rewrite.js';
 
 const displayUrl = (url) => url.replace(/\.git$/, '');
 
@@ -73,6 +74,13 @@ function copyCommits(source, target, tips) {
   return missing;
 }
 
+/** Copie un tag (et son message s'il est annoté) d'un dépôt à l'autre. */
+function copyTag(source, target, name) {
+  target.tags[name] = source.tags[name];
+  if (hasOwn(source.tagMeta, name)) target.tagMeta[name] = clone(source.tagMeta[name]);
+  else delete target.tagMeta[name];
+}
+
 function registerLanes(repo, ids) {
   for (const id of ids) {
     const lane = repo.commits[id].lane;
@@ -99,6 +107,12 @@ function fetchInto(s, remote, { prune = false } = {}) {
     repo.remoteRefs[ref] = tip;
     changes.push({ branch, ref, old, tip, forced: old !== undefined && !isAncestor(repo, old, tip) });
   }
+  // Comme Git, fetch ramène aussi les nouveaux tags dont le commit fait partie de l'historique téléchargé.
+  for (const name of Object.keys(server.tags).sort(byteOrder)) {
+    if (hasOwn(repo.tags, name) || !hasOwn(repo.commits, server.tags[name])) continue;
+    copyTag(server, repo, name);
+    changes.push({ branch: name, ref: name, tip: server.tags[name], isTag: true });
+  }
   if (prune) {
     for (const ref of Object.keys(repo.remoteRefs).sort(byteOrder)) {
       if (splitRef(ref).remote !== remote || hasOwn(server.branches, splitRef(ref).branch)) continue;
@@ -111,6 +125,7 @@ function fetchInto(s, remote, { prune = false } = {}) {
   const width = Math.max(10, ...changes.map((c) => c.branch.length));
   const lines = changes.map((c) => {
     if (c.deleted) return refLine('-', '[deleted]', c.branch, c.ref, width);
+    if (c.isTag) return refLine('*', '[new tag]', c.branch, c.ref, width);
     if (c.old === undefined) return refLine('*', '[new branch]', c.branch, c.ref, width);
     if (c.forced) return refLine('+', `${c.old}...${c.tip}`, c.branch, c.ref, width, ' (forced update)');
     return refLine(' ', `${c.old}..${c.tip}`, c.branch, c.ref, width);
@@ -221,6 +236,7 @@ const PUSH_HINTS = {
     "hint: use 'git pull' before pushing again.",
     "hint: See the 'Note about fast-forwards' in 'git push --help' for details.",
   ],
+  'already exists': ['hint: Updates were rejected because the tag already exists in the remote.'],
 };
 
 function parseRefspec(spec) {
@@ -228,7 +244,18 @@ function parseRefspec(spec) {
   return i === -1 ? { src: spec, dst: spec } : { src: spec.slice(0, i), dst: spec.slice(i + 1) };
 }
 
-export function push(state, { remote = null, refspecs = [], setUpstream = false, force = false, del = false } = {}) {
+export function push(
+  state,
+  {
+    remote = null,
+    refspecs = [],
+    setUpstream = false,
+    force = false,
+    forceLease = false,
+    del = false,
+    tags = false,
+  } = {},
+) {
   const error = requireRepo(state);
   if (error) return error;
   const repo = state.repo;
@@ -248,6 +275,8 @@ export function push(state, { remote = null, refspecs = [], setUpstream = false,
     pairs = refspecs.map((spec) => ({ src: null, dst: spec }));
   } else if (refspecs.length) {
     pairs = refspecs.map(parseRefspec);
+  } else if (tags) {
+    pairs = [];
   } else {
     if (!branch) {
       return failure(state, [
@@ -282,17 +311,20 @@ export function push(state, { remote = null, refspecs = [], setUpstream = false,
       return failure(state, `fatal: invalid refspec '${pair.src ?? ''}:${pair.dst}'`);
     }
   }
+  if (tags) pairs.push(...Object.keys(repo.tags).sort(byteOrder).map((tag) => ({ src: tag, dst: tag, tag: true })));
 
   const s = clone(state);
   const r = s.repo;
   const url = r.remotes[name].url;
   const server = s.servers[url];
-  const width = Math.max(...pairs.map((p) => (p.src ?? p.dst).length));
+  const width = Math.max(0, ...pairs.map((p) => (p.src ?? p.dst).length));
   const lines = [];
   const errors = [];
   const created = [];
   const updated = [];
   const deleted = [];
+  const pushedTags = [];
+  const deletedTags = [];
   const trackingSet = [];
   let upToDate = 0;
   let rejected = null;
@@ -300,15 +332,39 @@ export function push(state, { remote = null, refspecs = [], setUpstream = false,
   for (const pair of pairs) {
     const { src, dst } = pair;
     if (del) {
-      if (!hasOwn(server.branches, dst)) {
+      if (hasOwn(server.branches, dst)) {
+        delete server.branches[dst];
+        delete r.remoteRefs[`${name}/${dst}`];
+        lines.push(` - ${'[deleted]'.padEnd(17)} ${dst}`);
+        deleted.push(dst);
+      } else if (hasOwn(server.tags, dst)) {
+        delete server.tags[dst];
+        delete server.tagMeta[dst];
+        lines.push(` - ${'[deleted]'.padEnd(17)} ${dst}`);
+        deletedTags.push(dst);
+      } else {
         errors.push(`error: unable to delete '${dst}': remote ref does not exist`);
         rejected ??= 'error';
-        continue;
       }
-      delete server.branches[dst];
-      delete r.remoteRefs[`${name}/${dst}`];
-      lines.push(` - ${'[deleted]'.padEnd(17)} ${dst}`);
-      deleted.push(dst);
+      continue;
+    }
+    if (pair.tag || (src !== 'HEAD' && !hasOwn(r.branches, src) && hasOwn(r.tags, src))) {
+      const srcId = r.tags[src];
+      const tip = get(server.tags, dst);
+      const addLine = (flag, summary, note = '') => lines.push(refLine(flag, summary, src, dst, width, note));
+      if (tip === srcId) upToDate++;
+      else if (tip === undefined || force) {
+        registerLanes(r, copyCommits(r, server, [srcId]));
+        server.tags[dst] = srcId;
+        if (hasOwn(r.tagMeta, src)) server.tagMeta[dst] = clone(r.tagMeta[src]);
+        else delete server.tagMeta[dst];
+        if (tip === undefined) addLine('*', '[new tag]');
+        else addLine('+', `${tip}...${srcId}`, ' (forced update)');
+        pushedTags.push(dst);
+      } else {
+        addLine('!', '[rejected]', ' (already exists)');
+        rejected ??= 'already exists';
+      }
       continue;
     }
     const srcId = src === 'HEAD' ? headCommitId(r) : get(r.branches, src);
@@ -331,7 +387,9 @@ export function push(state, { remote = null, refspecs = [], setUpstream = false,
     } else {
       const known = hasOwn(r.commits, tip);
       const fastForward = known && isAncestor(r, tip, srcId);
-      if (fastForward || force) {
+      // --force-with-lease ne force que si la branche distante est encore là où votre dernier fetch l'a vue.
+      const leased = forceLease && tip === get(r.remoteRefs, ref);
+      if (fastForward || force || leased) {
         copyCommits(r, server, [srcId]);
         server.branches[dst] = srcId;
         r.remoteRefs[ref] = srcId;
@@ -339,7 +397,7 @@ export function push(state, { remote = null, refspecs = [], setUpstream = false,
         else addLine('+', `${tip}...${srcId}`, ' (forced update)');
         updated.push(dst);
       } else {
-        const reason = known ? 'non-fast-forward' : 'fetch first';
+        const reason = forceLease ? 'stale info' : known ? 'non-fast-forward' : 'fetch first';
         addLine('!', '[rejected]', ` (${reason})`);
         rejected = rejected === 'fetch first' ? rejected : reason;
         continue;
@@ -355,13 +413,24 @@ export function push(state, { remote = null, refspecs = [], setUpstream = false,
   if (lines.length) out.push(`To ${url}`, ...lines);
   if (rejected) out.push(`error: failed to push some refs to '${url}'`, ...(PUSH_HINTS[rejected] ?? []));
   out.push(...trackingSet);
-  const changed = created.length + updated.length + deleted.length + trackingSet.length > 0;
-  if (!lines.length && !rejected && upToDate) out.push('Everything up-to-date');
+  const changed =
+    created.length + updated.length + deleted.length + pushedTags.length + deletedTags.length + trackingSet.length > 0;
+  if (!lines.length && !rejected && (upToDate || !pairs.length)) out.push('Everything up-to-date');
   return {
     state: changed ? s : state,
     out,
     ok: !rejected,
-    info: { kind: 'push', remote: name, created, updated, deleted, upToDate: !!upToDate && !changed, rejected },
+    info: {
+      kind: 'push',
+      remote: name,
+      created,
+      updated,
+      deleted,
+      tags: pushedTags,
+      deletedTags,
+      upToDate: !!upToDate && !changed,
+      rejected,
+    },
   };
 }
 
@@ -400,7 +469,7 @@ function noTrackingLines(repo, branch) {
 
 export function pull(
   state,
-  { remote = null, branch = null, ffOnly = false, noRebase = false, noFF = false } = {},
+  { remote = null, branch = null, ffOnly = false, noRebase = false, noFF = false, rebase: rebaseFlag = false } = {},
   env = defaultEnv,
 ) {
   const error = requireRepo(state);
@@ -456,17 +525,27 @@ export function pull(
   const diverged = ours && !isAncestor(s.repo, theirs, ours) && !isAncestor(s.repo, ours, theirs);
   // Comme Git, on applique les réglages pull.rebase et pull.ff sauf option contraire en ligne de commande.
   const fastForwardOnly = ffOnly || (!noRebase && state.config['pull.ff'] === 'only');
-  if (diverged && !noRebase && !fastForwardOnly) {
-    if (state.config['pull.rebase'] === 'true') {
-      return failure(dirty, [
-        ...fetched.lines,
-        'Commande non supportée dans ce simulateur.',
-        '(pull.rebase=true demande un rebase, prévu dans une prochaine version.)',
-      ]);
+  const wantRebase = rebaseFlag || (!noRebase && !fastForwardOnly && state.config['pull.rebase'] === 'true');
+  if (wantRebase && ours) {
+    if (isAncestor(s.repo, theirs, ours)) {
+      return success(dirty, [...fetched.lines, 'Already up to date.'], {
+        kind: 'pull',
+        remote: name,
+        branch: target,
+        fetched: fetched.newCommits,
+        merge: { kind: 'merge-uptodate' },
+      });
     }
-    if (state.config['pull.rebase'] !== 'false') {
-      return failure(dirty, [...fetched.lines, ...DIVERGENT], { kind: 'pull-divergent', ref });
-    }
+    const rebased = rebase(s, { upstream: ref }, env);
+    return {
+      state: rebased.state,
+      out: [...fetched.lines, ...rebased.out],
+      ok: rebased.ok,
+      info: { kind: 'pull', remote: name, branch: target, fetched: fetched.newCommits, merge: rebased.info },
+    };
+  }
+  if (diverged && !noRebase && !fastForwardOnly && state.config['pull.rebase'] !== 'false') {
+    return failure(dirty, [...fetched.lines, ...DIVERGENT], { kind: 'pull-divergent', ref });
   }
   const url = s.repo.remotes[name].url;
   const merged = merge(
@@ -514,6 +593,7 @@ export function cloneRepo(state, { url = null } = {}) {
     if (!repo.lanes.includes(b)) repo.lanes.push(b);
     repo.remoteRefs[`origin/${b}`] = server.branches[b];
   }
+  for (const name of Object.keys(server.tags)) if (hasOwn(repo.commits, server.tags[name])) copyTag(server, repo, name);
   if (!branches.length) {
     return success(s, ["Cloning into '.'...", 'warning: You appear to have cloned an empty repository.'], {
       kind: 'clone',

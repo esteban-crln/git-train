@@ -12,9 +12,6 @@ export const STATE_VERSION = 1;
 export const DEFAULT_BRANCH = 'main';
 export const REPO_PATH = '/home/apprenant/projet';
 
-// Prévues par l'architecture (état réservé : tags, stash), pas encore simulées.
-export const PLANNED_COMMANDS = ['reset', 'revert', 'cherry-pick', 'stash', 'tag', 'rebase'];
-
 const DEFAULT_USER = Object.freeze({ name: 'Apprenant', email: 'apprenant@exemple.fr' });
 const NOT_A_REPO = 'fatal: not a git repository (or any of the parent directories): .git';
 
@@ -65,7 +62,7 @@ export const COLLEAGUE = Object.freeze({ name: 'Camille', email: 'camille@exempl
 
 /** Dépôt distant vide, tel qu'un nouveau dépôt GitHub. */
 export function emptyServer() {
-  return { head: DEFAULT_BRANCH, branches: {}, commits: {}, seq: 0 };
+  return { head: DEFAULT_BRANCH, branches: {}, commits: {}, seq: 0, tags: {}, tagMeta: {} };
 }
 
 /** Dépôt de démonstration que `git clone` peut récupérer. */
@@ -102,6 +99,7 @@ function seedServer() {
   ];
   const server = emptyServer();
   server.branches = { main: 'c3d4e5f', feature: 'd4e5f6a' };
+  server.tags = { 'v0.1': 'b2c3d4e' };
   steps.forEach((step, i) => {
     const parent = step.parent ? server.commits[step.parent] : null;
     server.commits[step.id] = {
@@ -142,11 +140,14 @@ export function createRepo() {
     seq: 0,
     // Ordre d'apparition des branches : sert à leur attribuer une couleur stable.
     lanes: [DEFAULT_BRANCH],
-    tags: {},
-    stash: [],
+    tags: {}, // nom -> id de commit
+    tagMeta: {}, // tags annotés : nom -> { message, tagger, timestamp }
+    stash: [], // le plus récent en premier : stash@{0}
     remotes: {}, // nom -> { url }
     remoteRefs: {}, // branches de suivi : 'origin/main' -> id de commit
     upstreams: {}, // branche locale -> branche de suivi
+    pick: null, // cherry-pick ou revert en cours (arrêté sur un conflit)
+    rebase: null, // rebase en cours (arrêté sur un conflit)
   };
 }
 
@@ -157,6 +158,9 @@ const validServer = (sv) =>
   isPlainObject(sv.commits) &&
   isStringMap(sv.branches) &&
   Object.values(sv.branches).every((id) => hasOwn(sv.commits, id)) &&
+  isStringMap(sv.tags) &&
+  Object.values(sv.tags).every((id) => hasOwn(sv.commits, id)) &&
+  isPlainObject(sv.tagMeta) &&
   Object.entries(sv.commits).every(
     ([id, c]) =>
       isPlainObject(c) &&
@@ -195,11 +199,47 @@ export function isValidState(s) {
     Object.values(r.remotes).every((x) => isPlainObject(x) && typeof x.url === 'string' && hasOwn(s.servers, x.url));
   if (!remotesOk || !isStringMap(r.remoteRefs) || !isStringMap(r.upstreams)) return false;
   if (!Object.values(r.remoteRefs).every((id) => hasOwn(r.commits, id))) return false;
+  if (!isStringMap(r.tags) || !Object.values(r.tags).every((id) => hasOwn(r.commits, id))) return false;
+  if (!isPlainObject(r.tagMeta) || !Array.isArray(r.stash)) return false;
+  const stashOk = (e) =>
+    isPlainObject(e) &&
+    typeof e.message === 'string' &&
+    hasOwn(r.commits, e.base) &&
+    isStringMap(e.index) &&
+    isStringMap(e.tree) &&
+    isStringMap(e.untracked);
+  if (!r.stash.every(stashOk)) return false;
   if (
     r.merge !== null &&
     !(isPlainObject(r.merge) && hasOwn(r.commits, r.merge.theirs) && isPlainObject(r.merge.conflicts))
   )
     return false;
+  const idsOk = (ids) => Array.isArray(ids) && ids.every((id) => hasOwn(r.commits, id));
+  const snapshotOk = (x) => isPlainObject(x) && isStringMap(x.index) && isStringMap(x.workdir);
+  const p = r.pick;
+  if (p !== null) {
+    const valid =
+      isPlainObject(p) &&
+      (p.kind === 'cherry-pick' || p.kind === 'revert') &&
+      (p.id === null || hasOwn(r.commits, p.id)) &&
+      idsOk(p.todo) &&
+      isPlainObject(p.conflicts) &&
+      isStringMap(p.theirsTree) &&
+      snapshotOk(p.saved);
+    if (!valid) return false;
+  }
+  const rb = r.rebase;
+  if (rb !== null) {
+    const valid =
+      isPlainObject(rb) &&
+      hasOwn(r.commits, rb.onto) &&
+      (rb.current === null || hasOwn(r.commits, rb.current)) &&
+      idsOk(rb.todo) &&
+      typeof rb.total === 'number' &&
+      isPlainObject(rb.conflicts) &&
+      snapshotOk(rb.saved);
+    if (!valid) return false;
+  }
   const h = r.head;
   if (!isPlainObject(h)) return false;
   if (h.type === 'branch') return typeof h.name === 'string';
@@ -212,15 +252,24 @@ export function normalizeState(state) {
   const s = { ...state };
   if (!isPlainObject(s.servers)) s.servers = { [DEMO_URL]: seedServer() };
   if (!isPlainObject(s.config)) s.config = {};
+  s.servers = Object.fromEntries(
+    Object.entries(s.servers).map(([url, sv]) => [
+      url,
+      isPlainObject(sv) ? { tags: {}, tagMeta: {}, ...sv } : sv,
+    ]),
+  );
   if (isPlainObject(s.repo)) {
     s.repo = {
       previousHead: null,
       merge: null,
       tags: {},
+      tagMeta: {},
       stash: [],
       remotes: {},
       remoteRefs: {},
       upstreams: {},
+      pick: null,
+      rebase: null,
       ...s.repo,
     };
     for (const remote of Object.values(s.repo.remotes)) {
@@ -275,8 +324,78 @@ export function headCommitId(repo) {
 
 export const currentBranch = (repo) => (repo.head.type === 'branch' ? repo.head.name : null);
 export const subject = (c) => c.message.split('\n')[0];
-const treeOf = (repo, id) => (id ? repo.commits[id].tree : {});
-const shortLine = (repo, id) => `${id} ${subject(repo.commits[id])}`;
+export const treeOf = (repo, id) => (id ? repo.commits[id].tree : {});
+export const shortLine = (repo, id) => `${id} ${subject(repo.commits[id])}`;
+
+/** Conflits de l'opération en cours (fusion, cherry-pick, revert ou rebase), ou un objet vide. */
+export const conflictsOf = (repo) => (repo.merge ?? repo.pick ?? repo.rebase)?.conflicts ?? {};
+
+/** Opération arrêtée qui bloque un nouveau départ : { name, noun } ou null. */
+export function operationInProgress(repo) {
+  if (repo.merge) return { name: 'merge', noun: 'merge', verb: 'merging', head: 'MERGE_HEAD' };
+  if (repo.rebase) return { name: 'rebase', noun: 'rebase', verb: 'rebasing', head: 'REBASE_HEAD' };
+  if (repo.pick) {
+    const revert = repo.pick.kind === 'revert';
+    return {
+      name: repo.pick.kind,
+      noun: repo.pick.kind,
+      verb: revert ? 'reverting' : 'cherry-picking',
+      head: revert ? 'REVERT_HEAD' : 'CHERRY_PICK_HEAD',
+    };
+  }
+  return null;
+}
+
+/* ------------------------------------------------------------------ .gitignore */
+
+export function globToRegExp(glob) {
+  const escape = (ch) => ch.replace(/[.+^${}()|[\]\\*?]/g, '\\$&');
+  let source = '';
+  for (let i = 0; i < glob.length; i++) {
+    const ch = glob[i];
+    if (ch === '*') {
+      source += '.*';
+      while (glob[i + 1] === '*') i++;
+    } else if (ch === '?') source += '.';
+    else if (ch === '[' && glob.indexOf(']', i + 2) !== -1) {
+      const end = glob.indexOf(']', i + 2);
+      source += `[${glob.slice(i + 1, end).replace(/^!/, '^').replace(/\\/g, '\\\\')}]`;
+      i = end;
+    } else if (ch === '\\' && i + 1 < glob.length) source += escape(glob[++i]);
+    else source += escape(ch);
+  }
+  try {
+    return new RegExp(`^${source}$`);
+  } catch {
+    return null;
+  }
+}
+
+/** Règles de .gitignore (un seul niveau : le simulateur n'a pas de sous-dossiers). */
+function ignoreRules(workdir) {
+  const content = get(workdir, '.gitignore');
+  if (content === undefined) return [];
+  const rules = [];
+  splitLines(content).forEach((raw, i) => {
+    let text = raw.replace(/(?<!\\)\s+$/, '');
+    if (!text || text.startsWith('#')) return;
+    const negate = text.startsWith('!');
+    if (negate) text = text.slice(1);
+    if (text.endsWith('/')) return; // un motif de dossier ne correspond à aucun fichier ici
+    text = text.replace(/^\//, '');
+    if (!text || text.includes('/')) return;
+    const regex = globToRegExp(text.replace(/^\\(?=[#!])/, ''));
+    if (regex) rules.push({ regex, negate, line: i + 1, text: raw });
+  });
+  return rules;
+}
+
+/** Règle de .gitignore qui ignore ce fichier (la dernière qui correspond l'emporte), ou null. */
+export function ignoreMatch(workdir, path) {
+  let found = null;
+  for (const rule of ignoreRules(workdir)) if (rule.regex.test(path)) found = rule.negate ? null : rule;
+  return found;
+}
 
 export function ancestors(repo, ...ids) {
   const seen = new Set();
@@ -292,7 +411,7 @@ export function ancestors(repo, ...ids) {
 
 export const isAncestor = (repo, ancestor, of) => ancestors(repo, of).has(ancestor);
 
-function mergeBase(repo, a, b) {
+export function mergeBase(repo, a, b) {
   const fromA = ancestors(repo, a);
   let best = null;
   for (const id of ancestors(repo, b)) {
@@ -325,6 +444,7 @@ export function resolveRevision(repo, rev) {
   const [, base, suffix] = match;
   let id;
   if (base === 'HEAD' || base === '@') id = headCommitId(repo);
+  else if (hasOwn(repo.tags, base)) id = repo.tags[base];
   else if (hasOwn(repo.branches, base)) id = repo.branches[base];
   else if (hasOwn(repo.remoteRefs, base)) id = repo.remoteRefs[base];
   else id = findCommitByPrefix(repo, base);
@@ -404,7 +524,7 @@ export function computeStatus(state) {
   const head = treeOf(repo, headCommitId(repo));
   const { index } = repo;
   const wd = state.workdir;
-  const conflicts = repo.merge?.conflicts ?? {};
+  const conflicts = conflictsOf(repo);
   const staged = [];
   const unstaged = [];
   for (const path of keysOf(head, index)) {
@@ -419,7 +539,9 @@ export function computeStatus(state) {
     if (!hasOwn(wd, path)) unstaged.push({ path, kind: 'deleted' });
     else if (wd[path] !== index[path]) unstaged.push({ path, kind: 'modified' });
   }
-  const untracked = keysOf(wd).filter((p) => !hasOwn(index, p) && !hasOwn(conflicts, p));
+  const rules = ignoreRules(wd);
+  const isIgnored = (p) => rules.reduce((hit, r) => (r.regex.test(p) ? !r.negate : hit), false);
+  const untracked = keysOf(wd).filter((p) => !hasOwn(index, p) && !hasOwn(conflicts, p) && !isIgnored(p));
   const unmerged = keysOf(conflicts).map((path) => ({ path, kind: conflicts[path] }));
   return { staged, unstaged, untracked, unmerged };
 }
@@ -499,7 +621,7 @@ function blobId(content) {
   return ((h1 >>> 0).toString(16).padStart(8, '0') + (h2 >>> 0).toString(16).padStart(8, '0')).slice(0, 7);
 }
 
-function treeChanges(from, to) {
+export function treeChanges(from, to) {
   return keysOf(from, to).flatMap((path) => {
     const before = get(from, path);
     const after = get(to, path);
@@ -511,7 +633,7 @@ function treeChanges(from, to) {
   });
 }
 
-function fileDiffLines({ path, before, after, ops }) {
+export function fileDiffLines({ path, before, after, ops }) {
   const bold = (text) => [[text, 'bold']];
   const out = [bold(`diff --git a/${path} b/${path}`)];
   if (before === undefined) out.push(bold('new file mode 100644'), bold(`index 0000000..${blobId(after)}`));
@@ -530,7 +652,7 @@ function fileDiffLines({ path, before, after, ops }) {
   return out;
 }
 
-function diffstatLines(changes) {
+export function diffstatLines(changes) {
   if (!changes.length) return [];
   const nameWidth = Math.max(...changes.map((c) => c.path.length));
   const maxTotal = Math.max(...changes.map((c) => c.ins + c.del));
@@ -545,7 +667,7 @@ function diffstatLines(changes) {
   });
 }
 
-function summaryLines(changes) {
+export function summaryLines(changes, { modes = true } = {}) {
   if (!changes.length) return [];
   const ins = changes.reduce((n, c) => n + c.ins, 0);
   const del = changes.reduce((n, c) => n + c.del, 0);
@@ -554,6 +676,7 @@ function summaryLines(changes) {
   if (ins) line += `, ${plural(ins, 'insertion')}(+)`;
   if (del) line += `, ${plural(del, 'deletion')}(-)`;
   const out = [line];
+  if (!modes) return out;
   for (const c of changes) {
     if (c.before === undefined) out.push(` create mode 100644 ${c.path}`);
     else if (c.after === undefined) out.push(` delete mode 100644 ${c.path}`);
@@ -663,16 +786,66 @@ export function init(state) {
 const CHANGE_LABEL = { new: 'new file:   ', modified: 'modified:   ', deleted: 'deleted:    ' };
 
 function headLine(repo) {
+  if (repo.rebase) return `interactive rebase in progress; onto ${repo.rebase.onto}`;
   if (repo.head.type === 'branch') return `On branch ${repo.head.name}`;
   const { commit: at, from } = repo.head;
   return [[`HEAD detached ${at === from ? 'at' : 'from'} ${from}`, 'red']];
 }
 
-function statusLines(state, { forCommit = false } = {}) {
+/** Commandes déjà rejouées et restantes d'un rebase, comme dans l'en-tête de `git status`. */
+function rebaseProgressLines(repo) {
+  const { all = [], step } = repo.rebase;
+  const line = (id) => `   pick ${id} # ${subject(repo.commits[id])}`;
+  const done = all.slice(0, step);
+  const next = all.slice(step);
+  const out = [];
+  if (!done.length) out.push('No commands done.');
+  else {
+    const noun = done.length > 1 ? 'Last commands done' : 'Last command done';
+    out.push(`${noun} (${plural(done.length, 'command')} done):`, ...done.slice(-2).map(line));
+    if (done.length > 2) out.push('  (see more in file .git/rebase-merge/done)');
+  }
+  if (!next.length) out.push('No commands remaining.');
+  else {
+    const noun = next.length > 1 ? 'Next commands to do' : 'Next command to do';
+    out.push(`${noun} (${plural(next.length, 'remaining command')}):`, ...next.slice(0, 2).map(line));
+    if (next.length > 2) out.push('  (see more in file .git/rebase-merge/git-rebase-todo)');
+    out.push('  (use "git rebase --edit-todo" to view and edit)');
+  }
+  return out;
+}
+
+/** Lignes d'un cherry-pick, d'un revert ou d'un rebase arrêté, telles que les affiche `git status`. */
+function sequencerLines(repo, unmerged) {
+  const resume = (cmd, conflict) =>
+    unmerged ? `  (${conflict} run "git ${cmd} --continue")` : `  (all conflicts fixed: run "git ${cmd} --continue")`;
+  if (repo.rebase) {
+    const { branch, onto } = repo.rebase;
+    return [
+      `You are currently rebasing${branch ? ` branch '${branch}'` : ''} on '${onto}'.`,
+      resume('rebase', 'fix conflicts and then'),
+      '  (use "git rebase --skip" to skip this patch)',
+      '  (use "git rebase --abort" to check out the original branch)',
+      '',
+    ];
+  }
+  const { kind, id } = repo.pick;
+  const verb = kind === 'revert' ? 'reverting' : 'cherry-picking';
+  return [
+    id ? `You are currently ${verb} commit ${id}.` : `Currently ${verb} a sequence of commits.`,
+    resume(kind, 'fix conflicts and'),
+    `  (use "git ${kind} --skip" to skip this patch)`,
+    `  (use "git ${kind} --abort" to cancel the ${kind} operation)`,
+    '',
+  ];
+}
+
+export function statusLines(state, { forCommit = false } = {}) {
   const repo = state.repo;
   const st = computeStatus(state);
   const initial = !headCommitId(repo);
   const out = [headLine(repo)];
+  if (repo.rebase) out.push(...rebaseProgressLines(repo));
   const tracking = repo.head.type === 'branch' ? branchTrackingLines(repo, repo.head.name) : [];
   if (tracking.length) out.push(...tracking, '');
   if (repo.merge) {
@@ -684,11 +857,13 @@ function statusLines(state, { forCommit = false } = {}) {
         '',
       );
     else out.push('All conflicts fixed but you are still merging.', '  (use "git commit" to conclude merge)', '');
+  } else if (repo.pick || repo.rebase) {
+    out.push(...sequencerLines(repo, st.unmerged.length > 0));
   }
   if (initial) out.push('', forCommit ? 'Initial commit' : 'No commits yet', '');
   if (st.staged.length) {
     out.push('Changes to be committed:');
-    if (!repo.merge)
+    if (!repo.merge && !repo.pick)
       out.push(
         initial
           ? '  (use "git rm --cached <file>..." to unstage)'
@@ -701,6 +876,7 @@ function statusLines(state, { forCommit = false } = {}) {
     const onlyContent = st.unmerged.every((e) => e.kind.startsWith('both'));
     out.push(
       'Unmerged paths:',
+      ...(repo.rebase ? ['  (use "git restore --staged <file>..." to unstage)'] : []),
       onlyContent
         ? '  (use "git add <file>..." to mark resolution)'
         : '  (use "git add/rm <file>..." as appropriate to mark resolution)',
@@ -773,7 +949,15 @@ export function status(state, { short = false, branch = false } = {}) {
   );
 }
 
-export function add(state, { paths = [], all = false } = {}) {
+const IGNORED_ADD_ERROR = (paths) => [
+  'The following paths are ignored by one of your .gitignore files:',
+  ...paths,
+  'hint: Use -f if you really want to add them.',
+  'hint: Turn this message off by running',
+  'hint: "git config advice.addIgnoredFile false"',
+];
+
+export function add(state, { paths = [], all = false, force = false } = {}) {
   const error = requireRepo(state);
   if (error) return error;
   if (!paths.length && !all) {
@@ -785,14 +969,21 @@ export function add(state, { paths = [], all = false } = {}) {
   }
   const s = clone(state);
   const repo = s.repo;
-  const conflicts = repo.merge?.conflicts ?? {};
-  const everything = () => keysOf(s.workdir, repo.index, conflicts);
+  const conflicts = conflictsOf(repo);
+  const rules = ignoreRules(s.workdir);
+  const matchesRules = (p) => rules.reduce((hit, r) => (r.regex.test(p) ? !r.negate : hit), false);
+  const ignored = (p) => !hasOwn(repo.index, p) && !hasOwn(conflicts, p) && matchesRules(p);
+  const everything = () => keysOf(s.workdir, repo.index, conflicts).filter((p) => force || !ignored(p));
   const targets = new Set(all ? everything() : []);
+  const refused = [];
   for (const spec of paths) {
     if (spec === '.' || spec === ':/') everything().forEach((p) => targets.add(p));
-    else if (hasOwn(s.workdir, spec) || hasOwn(repo.index, spec) || hasOwn(conflicts, spec)) targets.add(spec);
-    else return failure(state, `fatal: pathspec '${spec}' did not match any files`);
+    else if (hasOwn(s.workdir, spec) || hasOwn(repo.index, spec) || hasOwn(conflicts, spec)) {
+      if (!force && ignored(spec)) refused.push(spec);
+      else targets.add(spec);
+    } else return failure(state, `fatal: pathspec '${spec}' did not match any files`);
   }
+  if (refused.length) return failure(state, IGNORED_ADD_ERROR(refused), { kind: 'add-ignored', paths: refused });
   const staged = [];
   const resolved = [];
   for (const path of targets) {
@@ -804,12 +995,12 @@ export function add(state, { paths = [], all = false } = {}) {
       resolved.push(path);
     } else if (get(repo.index, path) !== before) staged.push(path);
   }
-  return success(s, [], { kind: 'add', staged, resolved });
+  return success(s, [], { kind: 'add', staged, resolved, op: operationInProgress(repo)?.name ?? null });
 }
 
 /* ------------------------------------------------------------------ git commit */
 
-function cleanupMessage(text) {
+export function cleanupMessage(text) {
   const lines = [];
   for (const raw of text.split('\n')) {
     const line = raw.replace(/\s+$/, '');
@@ -820,18 +1011,21 @@ function cleanupMessage(text) {
   return lines.join('\n');
 }
 
-function createCommit(repo, { message, parents, tree, author, env }) {
+/** `lane` et `timestamp` sont imposés quand on rejoue (rebase, cherry-pick) ou réécrit (amend) un commit. */
+export function createCommit(
+  repo,
+  { message, parents, tree, author, env, lane = currentBranch(repo), timestamp = env.now() },
+) {
   let hash;
   do hash = env.randomHex(40);
   while (hasOwn(repo.commits, hash.slice(0, 7)));
-  const lane = currentBranch(repo);
   const created = {
     id: hash.slice(0, 7),
     hash,
     message,
     parents,
     author: { name: author.name, email: author.email },
-    timestamp: env.now(),
+    timestamp,
     tree: { ...tree },
     lane,
     seq: ++repo.seq,
@@ -841,62 +1035,91 @@ function createCommit(repo, { message, parents, tree, author, env }) {
   return created;
 }
 
-function moveHead(repo, id) {
+export function moveHead(repo, id) {
   if (repo.head.type === 'branch') repo.branches[repo.head.name] = id;
   else repo.head.commit = id;
 }
 
-const UNMERGED_COMMIT_ERROR = [
+export const UNMERGED_COMMIT_ERROR = [
   'error: Committing is not possible because you have unmerged files.',
   "hint: Fix them up in the work tree, and then use 'git add/rm <file>'",
   'hint: as appropriate to mark resolution and make a commit.',
   'fatal: Exiting because of an unresolved conflict.',
 ];
 
-export function commit(state, { message = null, all = false, allowEmpty = false } = {}, env = defaultEnv) {
+export function commit(
+  state,
+  { message = null, all = false, allowEmpty = false, amend = false, noEdit = false } = {},
+  env = defaultEnv,
+) {
   const error = requireRepo(state);
   if (error) return error;
   const s = clone(state);
   const repo = s.repo;
+  const op = repo.merge ?? repo.pick ?? repo.rebase ?? null;
+  const headId = headCommitId(repo);
+  if (amend) {
+    if (op) {
+      return failure(state, `fatal: You are in the middle of a ${operationInProgress(repo).name} -- cannot amend.`);
+    }
+    if (!headId) return failure(state, 'fatal: You have nothing to amend.');
+  }
+  const old = amend ? repo.commits[headId] : null;
   const autoStaged = [];
   if (all) {
-    for (const path of keysOf(repo.index, repo.merge?.conflicts ?? {})) {
+    for (const path of keysOf(repo.index, conflictsOf(repo))) {
       const before = get(repo.index, path);
       if (hasOwn(s.workdir, path)) repo.index[path] = s.workdir[path];
       else delete repo.index[path];
-      if (repo.merge) delete repo.merge.conflicts[path];
+      if (op) delete op.conflicts[path];
       if (get(repo.index, path) !== before) autoStaged.push(path);
     }
   }
-  if (repo.merge && Object.keys(repo.merge.conflicts).length) {
-    return failure(state, [...UNMERGED_COMMIT_ERROR, ...keysOf(repo.merge.conflicts).map((p) => `U\t${p}`)]);
+  if (Object.keys(conflictsOf(repo)).length) {
+    return failure(state, [...UNMERGED_COMMIT_ERROR, ...keysOf(conflictsOf(repo)).map((p) => `U\t${p}`)]);
   }
-  const parentId = headCommitId(repo);
-  const changes = treeChanges(treeOf(repo, parentId), repo.index);
-  if (!changes.length && !repo.merge && !allowEmpty)
+  const changes = treeChanges(treeOf(repo, amend ? (old.parents[0] ?? null) : headId), repo.index);
+  if (!amend && !changes.length && !repo.merge && !allowEmpty)
     return failure(state, statusLines(s, { forCommit: true }), { kind: 'nothing-to-commit' });
-  if (message === null && !repo.merge)
-    return failure(state, 'Aborting commit due to empty commit message.', { kind: 'no-editor' });
-  const text = cleanupMessage(message ?? repo.merge.message);
+  const pending = op?.message ?? null;
+  if (message === null && !(amend && noEdit) && pending === null)
+    return failure(state, 'Aborting commit due to empty commit message.', { kind: 'no-editor', amend });
+  const text = cleanupMessage(message ?? (amend ? old.message : pending));
   if (!text) return failure(state, 'Aborting commit due to empty commit message.');
 
   const merging = repo.merge;
-  const parents = [parentId, merging?.theirs].filter(Boolean);
+  const replay = repo.pick ?? repo.rebase; // porte l'auteur et la date du commit d'origine
   const branch = currentBranch(repo);
-  const created = createCommit(repo, { message: text, parents, tree: repo.index, author: s.user, env });
+  const created = createCommit(repo, {
+    message: text,
+    parents: amend ? [...old.parents] : [headId, merging?.theirs].filter(Boolean),
+    tree: repo.index,
+    author: amend ? old.author : (replay?.author ?? s.user),
+    timestamp: amend ? old.timestamp : (replay?.timestamp ?? env.now()),
+    lane: amend ? old.lane : repo.rebase ? repo.rebase.branch : branch,
+    env,
+  });
   moveHead(repo, created.id);
   repo.merge = null;
-  const where = branch ? `${branch}${parentId ? '' : ' (root-commit)'}` : 'detached HEAD';
+  if (repo.pick) {
+    if (repo.pick.todo.length) Object.assign(repo.pick, { id: null, message: null, conflicts: {} });
+    else repo.pick = null;
+  }
+  if (repo.rebase) Object.assign(repo.rebase, { current: null, message: null, conflicts: {} });
+  const where = branch ? `${branch}${created.parents.length ? '' : ' (root-commit)'}` : 'detached HEAD';
   const out = [`[${where} ${created.id}] ${subject(created)}`];
+  if (amend || replay?.timestamp != null) out.push(` Date: ${gitDate(created.timestamp)}`);
   if (!merging) out.push(...summaryLines(changes));
   return success(s, out, {
     kind: 'commit',
     id: created.id,
     branch,
-    parent: parentId,
+    parent: created.parents[0] ?? null,
     merged: merging ? merging.label : null,
     autoStaged,
     files: changes.length,
+    amend,
+    old: old?.id ?? null,
   });
 }
 
@@ -905,7 +1128,7 @@ export function commit(state, { message = null, all = false, allowEmpty = false 
 const DAYS = ['Sun', 'Mon', 'Tue', 'Wed', 'Thu', 'Fri', 'Sat'];
 const MONTHS = ['Jan', 'Feb', 'Mar', 'Apr', 'May', 'Jun', 'Jul', 'Aug', 'Sep', 'Oct', 'Nov', 'Dec'];
 
-function gitDate(timestamp) {
+export function gitDate(timestamp) {
   const d = new Date(timestamp);
   const pad = (n) => String(n).padStart(2, '0');
   const offset = -d.getTimezoneOffset();
@@ -1025,13 +1248,32 @@ function asciiGraph(repo, order) {
   });
 }
 
-export function log(state, { oneline = false, graph = false, all = false, revs = [], maxCount = Infinity } = {}) {
+export function log(
+  state,
+  { oneline = false, graph = false, all = false, revs = [], maxCount = Infinity, paths = [], mergeOnly = false } = {},
+) {
   const error = requireRepo(state);
   if (error) return error;
   const repo = state.repo;
   let tips = [];
-  if (all)
-    tips = [...Object.values(repo.branches), ...Object.values(repo.remoteRefs), headCommitId(repo)].filter(Boolean);
+  let keep = null; // commits autorisés, quand --merge restreint l'historique
+  let filePaths = paths;
+  if (mergeOnly) {
+    // --merge : commits des deux côtés d'un conflit (HEAD...MERGE_HEAD) qui touchent un fichier en conflit
+    const other = repo.merge?.theirs ?? repo.pick?.id ?? repo.rebase?.current ?? null;
+    if (!other) return failure(state, 'fatal: --merge without MERGE_HEAD?');
+    const mine = ancestors(repo, headCommitId(repo));
+    const theirs = ancestors(repo, other);
+    keep = new Set([...mine, ...theirs].filter((id) => !(mine.has(id) && theirs.has(id))));
+    tips = [headCommitId(repo), other];
+    filePaths = keysOf(conflictsOf(repo));
+  } else if (all)
+    tips = [
+      ...Object.values(repo.branches),
+      ...Object.values(repo.remoteRefs),
+      ...Object.values(repo.tags),
+      headCommitId(repo),
+    ].filter(Boolean);
   else if (revs.length) {
     for (const rev of revs) {
       const id = resolveRevision(repo, rev);
@@ -1049,7 +1291,15 @@ export function log(state, { oneline = false, graph = false, all = false, revs =
     if (!head) return failure(state, `fatal: your current branch '${repo.head.name}' does not have any commits yet`);
     tips = [head];
   }
-  const order = (graph ? topoOrder(repo, tips) : dateOrder(repo, tips)).slice(0, maxCount);
+  const touches = (id) => {
+    const c = repo.commits[id];
+    const parents = c.parents.length ? c.parents : [null];
+    return parents.every((p) => filePaths.some((path) => get(c.tree, path) !== get(treeOf(repo, p), path)));
+  };
+  let order = graph ? topoOrder(repo, tips) : dateOrder(repo, tips);
+  if (keep) order = order.filter((id) => keep.has(id));
+  if (keep || filePaths.length) order = order.filter(touches);
+  order = order.slice(0, maxCount);
   const rows = graph ? asciiGraph(repo, order) : null;
   const out = [];
   order.forEach((id, i) => {
@@ -1074,7 +1324,7 @@ export function log(state, { oneline = false, graph = false, all = false, revs =
     body.forEach((line, k) => out.push((k === 0 && g.expand ? g.expand : g.body) + line));
     out.push(...g.collapse);
   });
-  return success(state, out, { kind: 'log', count: order.length, graph });
+  return success(state, out, { kind: 'log', count: order.length, graph, mergeOnly, files: filePaths.length > 0 });
 }
 
 /* ------------------------------------------------------------------ git branch */
@@ -1213,9 +1463,15 @@ export function branchSetUpstream(state, { upstream = null, branch = null, unset
 
 /* ------------------------------------------------------------------ git checkout / switch */
 
-const ACTION_VERB = { checkout: 'switch branches', merge: 'merge' };
+const ACTION_VERB = {
+  checkout: 'switch branches',
+  merge: 'merge',
+  rebase: 'rebase',
+  'cherry-pick': 'cherry-pick',
+  revert: 'revert',
+};
 
-function overwriteError(dirty, untracked, action) {
+export function overwriteError(dirty, untracked, action) {
   if (dirty.length) {
     return [
       `error: Your local changes to the following files would be overwritten by ${action}:`,
@@ -1237,7 +1493,7 @@ function overwriteError(dirty, untracked, action) {
  * en conservant, comme Git, les modifications locales qui ne gênent pas.
  * Renvoie null si tout va bien, sinon les lignes d'erreur (sans rien modifier).
  */
-function switchTree(s, from, to, action) {
+export function switchTree(s, from, to, action) {
   const { index } = s.repo;
   const wd = s.workdir;
   const paths = keysOf(from, to).filter((p) => get(from, p) !== get(to, p));
@@ -1266,6 +1522,19 @@ function switchTree(s, from, to, action) {
     }
   }
   return null;
+}
+
+/**
+ * Équivalent de `git reset --hard` vers `tree` sur `s` : l'index et les fichiers suivis prennent l'arbre,
+ * les fichiers non suivis restent en place.
+ */
+export function resetToTree(s, tree) {
+  const repo = s.repo;
+  for (const path of keysOf(repo.index, tree, conflictsOf(repo))) {
+    if (hasOwn(tree, path)) s.workdir[path] = tree[path];
+    else delete s.workdir[path];
+  }
+  repo.index = { ...tree };
 }
 
 function localChangeLines(state) {
@@ -1321,11 +1590,12 @@ const detachedAdvice = (rev) => [
 ];
 
 function mergeInProgressError(repo) {
-  if (!repo.merge) return null;
-  const unmerged = keysOf(repo.merge.conflicts);
+  const op = operationInProgress(repo);
+  if (!op) return null;
+  const unmerged = keysOf(conflictsOf(repo));
   if (unmerged.length)
     return ['error: you need to resolve your current index first', ...unmerged.map((p) => `${p}: needs merge`)];
-  return ['fatal: cannot switch branch while merging', 'Consider "git merge --quit" or "git worktree add".'];
+  return [`fatal: cannot switch branch while ${op.verb}`, `Consider "git ${op.name} --quit" or "git worktree add".`];
 }
 
 /** Déplace HEAD vers une branche ({ branch }) ou un commit ({ commit }). */
@@ -1419,7 +1689,7 @@ function switchToPrevious(state, mode) {
 
 function checkoutPaths(state, paths, quiet = false) {
   const repo = state.repo;
-  const conflicts = repo.merge?.conflicts ?? {};
+  const conflicts = conflictsOf(repo);
   const targets = paths.includes('.') ? keysOf(repo.index) : paths;
   for (const path of targets) {
     if (hasOwn(conflicts, path)) return failure(state, `error: path '${path}' is unmerged`);
@@ -1433,6 +1703,75 @@ function checkoutPaths(state, paths, quiet = false) {
     kind: 'restore',
     paths: restored,
   });
+}
+
+/** Versions « ours » (HEAD) et « theirs » (l'autre côté) d'un conflit en cours. */
+function conflictSides(repo) {
+  let theirs = null;
+  if (repo.merge) theirs = treeOf(repo, repo.merge.theirs);
+  else if (repo.pick) theirs = repo.pick.theirsTree;
+  else if (repo.rebase?.current) theirs = treeOf(repo, repo.rebase.current);
+  return { ours: treeOf(repo, headCommitId(repo)), theirs };
+}
+
+const notFoundPath = (path) => `error: pathspec '${path}' did not match any file(s) known to git`;
+
+/**
+ * Remet des fichiers dans l'état d'un commit, de l'index ou d'un côté d'un conflit.
+ *   source : commit à lire (sinon l'index pour le répertoire de travail, HEAD pour l'index) ;
+ *   staged / worktree : zones à écraser ; side : 'ours' ou 'theirs' (répertoire de travail seulement) ;
+ *   from : texte de « Updated N paths from … », utilisé par git checkout.
+ */
+export function restorePaths(
+  state,
+  { paths, source = null, staged = false, worktree = true, side = null, from = null },
+) {
+  const error = requireRepo(state);
+  if (error) return error;
+  const repo = state.repo;
+  if (!paths.length) return failure(state, 'fatal: you must specify path(s) to restore');
+  const conflicts = conflictsOf(repo);
+  let tree;
+  if (side) tree = conflictSides(repo)[side] ?? {};
+  else if (source !== null) {
+    const id = resolveRevision(repo, source);
+    if (!id) return failure(state, `fatal: could not resolve ${source}`);
+    tree = treeOf(repo, id);
+  } else tree = staged ? treeOf(repo, headCommitId(repo)) : repo.index;
+
+  const tracked = keysOf(repo.index, tree);
+  const targets = paths.includes('.') ? tracked : paths;
+  for (const path of targets) {
+    if (side) {
+      if (!hasOwn(conflicts, path) && !hasOwn(repo.index, path)) return failure(state, notFoundPath(path));
+      continue;
+    }
+    if (hasOwn(conflicts, path)) return failure(state, `error: path '${path}' is unmerged`);
+    if (!hasOwn(tree, path) && !(staged && hasOwn(repo.index, path))) return failure(state, notFoundPath(path));
+  }
+  const s = clone(state);
+  const changed = [];
+  for (const path of targets) {
+    if (side && !hasOwn(conflicts, path)) continue;
+    const content = get(tree, path);
+    if (side && content === undefined) {
+      return failure(state, `error: path '${path}' does not have ${side === 'ours' ? 'our' : 'their'} version`);
+    }
+    let moved = false;
+    if (worktree && get(s.workdir, path) !== content) {
+      if (content === undefined) delete s.workdir[path];
+      else s.workdir[path] = content;
+      moved = true;
+    }
+    if (staged && get(s.repo.index, path) !== content) {
+      if (content === undefined) delete s.repo.index[path];
+      else s.repo.index[path] = content;
+      moved = true;
+    }
+    if (moved) changed.push(path);
+  }
+  const out = from === null ? [] : [`Updated ${plural(changed.length, 'path')} from ${from}`];
+  return success(s, out, { kind: 'restore', paths: changed, staged, worktree, source, side });
 }
 
 export function checkout(state, { target = null, newBranch = null, paths = [], detach = false, quiet = false } = {}) {
@@ -1478,7 +1817,7 @@ export function switchBranch(state, { target = null, create = null, detach = fal
 
 /* ------------------------------------------------------------------ git merge */
 
-function conflictMarkers(ours, theirs, label) {
+function conflictMarkers(ours, theirs, label, oursLabel = 'HEAD') {
   const a = splitLines(ours);
   const b = splitLines(theirs);
   let pre = 0;
@@ -1488,7 +1827,7 @@ function conflictMarkers(ours, theirs, label) {
   return (
     [
       ...a.slice(0, pre),
-      '<<<<<<< HEAD',
+      `<<<<<<< ${oursLabel}`,
       ...a.slice(pre, a.length - suf),
       '=======',
       ...b.slice(pre, b.length - suf),
@@ -1520,21 +1859,12 @@ function fastForward(state, theirs, target, into) {
   return success(s, out, { kind: 'merge-ff', target, into, from: ours, to: theirs });
 }
 
-function threeWayMerge(state, ours, theirs, target, into, message, env) {
-  const staged = computeStatus(state).staged;
-  if (staged.length) {
-    return failure(state, [
-      'error: Your local changes to the following files would be overwritten by merge:',
-      ...staged.map((e) => `\t${e.path}`),
-      'Please commit your changes or stash them before you merge.',
-      'Aborting',
-    ]);
-  }
-  const s = clone(state);
-  const repo = s.repo;
-  const baseTree = treeOf(repo, mergeBase(repo, ours, theirs));
-  const oursTree = treeOf(repo, ours);
-  const theirsTree = treeOf(repo, theirs);
+/**
+ * Fusion à trois voies de trois arbres : renvoie les fichiers fusionnés, les conflits (avec leur type et le
+ * contenu à écrire, marqueurs compris) et les messages « Auto-merging / CONFLICT » de Git.
+ * `label` nomme le côté « theirs » dans les marqueurs et les messages.
+ */
+export function mergeTrees3(baseTree, oursTree, theirsTree, label, { oursLabel = 'HEAD' } = {}) {
   const merged = {};
   const conflicts = {};
   const conflictContent = {};
@@ -1549,7 +1879,7 @@ function threeWayMerge(state, ours, theirs, target, into, message, env) {
       if (t !== undefined) merged[path] = t;
     } else if (o !== undefined && t !== undefined) {
       conflicts[path] = b === undefined ? 'both added' : 'both modified';
-      conflictContent[path] = conflictMarkers(o, t, target);
+      conflictContent[path] = conflictMarkers(o, t, label, oursLabel);
       notes.push(
         `Auto-merging ${path}`,
         `CONFLICT (${b === undefined ? 'add/add' : 'content'}): Merge conflict in ${path}`,
@@ -1559,18 +1889,27 @@ function threeWayMerge(state, ours, theirs, target, into, message, env) {
       conflictContent[path] = o ?? t;
       notes.push(
         o === undefined
-          ? `CONFLICT (modify/delete): ${path} deleted in HEAD and modified in ${target}.  Version ${target} of ${path} left in tree.`
-          : `CONFLICT (modify/delete): ${path} deleted in ${target} and modified in HEAD.  Version HEAD of ${path} left in tree.`,
+          ? `CONFLICT (modify/delete): ${path} deleted in ${oursLabel} and modified in ${label}.  Version ${label} of ${path} left in tree.`
+          : `CONFLICT (modify/delete): ${path} deleted in ${label} and modified in ${oursLabel}.  Version ${oursLabel} of ${path} left in tree.`,
       );
     }
   }
+  return { merged, conflicts, conflictContent, notes };
+}
 
+/**
+ * Écrit le résultat d'une fusion dans l'index et le répertoire de travail de `s` (copie modifiable).
+ * Refuse, sans rien toucher, d'écraser une modification locale ou un fichier non suivi.
+ * Renvoie { error } ou { saved } (l'index et le répertoire de travail d'avant, pour pouvoir annuler).
+ */
+export function writeMerge(s, oursTree, { merged, conflictContent }, action = 'merge') {
+  const repo = s.repo;
   const touched = keysOf(oursTree, merged, conflictContent).filter(
     (p) => hasOwn(conflictContent, p) || get(merged, p) !== get(oursTree, p),
   );
   const dirty = touched.filter((p) => hasOwn(oursTree, p) && get(s.workdir, p) !== oursTree[p]);
   const untracked = touched.filter((p) => !hasOwn(oursTree, p) && hasOwn(s.workdir, p));
-  if (dirty.length || untracked.length) return failure(state, overwriteError(dirty, untracked, 'merge'));
+  if (dirty.length || untracked.length) return { error: overwriteError(dirty, untracked, action) };
 
   const saved = { index: clone(repo.index), workdir: clone(s.workdir) };
   for (const path of touched) {
@@ -1586,6 +1925,28 @@ function threeWayMerge(state, ours, theirs, target, into, message, env) {
       delete s.workdir[path];
     }
   }
+  return { saved };
+}
+
+function threeWayMerge(state, ours, theirs, target, into, message, env) {
+  const staged = computeStatus(state).staged;
+  if (staged.length) {
+    return failure(state, [
+      'error: Your local changes to the following files would be overwritten by merge:',
+      ...staged.map((e) => `\t${e.path}`),
+      'Please commit your changes or stash them before you merge.',
+      'Aborting',
+    ]);
+  }
+  const s = clone(state);
+  const repo = s.repo;
+  const oursTree = treeOf(repo, ours);
+  const theirsTree = treeOf(repo, theirs);
+  const outcome = mergeTrees3(treeOf(repo, mergeBase(repo, ours, theirs)), oursTree, theirsTree, target);
+  const { conflicts, notes } = outcome;
+  const written = writeMerge(s, oursTree, outcome);
+  if (written.error) return failure(state, written.error);
+  const { saved } = written;
   const text = message ?? defaultMergeMessage(repo, target, into);
   if (Object.keys(conflicts).length) {
     repo.merge = { theirs, label: target, message: text, conflicts, saved };
@@ -1623,6 +1984,13 @@ export function merge(
     s.repo.merge = null;
     return success(s, [], { kind: 'merge-abort' });
   }
+  if (repo.pick || repo.rebase) {
+    const op = operationInProgress(repo);
+    return failure(state, [
+      `fatal: You have not concluded your ${op.noun} (${op.head} exists).`,
+      'Please, commit your changes before you merge.',
+    ]);
+  }
   if (repo.merge) {
     return failure(
       state,
@@ -1648,13 +2016,42 @@ export function merge(
 
 /* ------------------------------------------------------------------ git diff */
 
-export function diff(state, { staged = false, paths = [] } = {}) {
+/** Résout les arguments de révision de git diff : `A`, `B`, `A..B` ou `A...B` (depuis l'ancêtre commun). */
+function diffRevisions(repo, revs) {
+  const ids = [];
+  for (const rev of revs) {
+    const range = /^(.*?)(\.{2,3})(.*)$/.exec(rev);
+    const parts = range ? [range[1] || 'HEAD', range[3] || 'HEAD'] : [rev];
+    const resolved = [];
+    for (const part of parts) {
+      const id = resolveRevision(repo, part);
+      if (!id) return { error: [`fatal: bad revision '${rev}'`] };
+      resolved.push(id);
+    }
+    if (range?.[2] === '...') resolved[0] = mergeBase(repo, resolved[0], resolved[1]) ?? resolved[0];
+    ids.push(...resolved);
+  }
+  if (ids.length > 2) return { error: ['fatal: too many revisions: a diff compares at most two commits'] };
+  return { ids };
+}
+
+const NAME_STATUS = (c) => (c.before === undefined ? 'A' : c.after === undefined ? 'D' : 'M');
+
+/**
+ * git diff : répertoire de travail ↔ index (défaut), index ↔ HEAD (--staged), ou entre commits.
+ * `revs` : 0 (défaut), 1 (commit ↔ répertoire de travail, ou ↔ index avec --staged) ou 2 révisions.
+ * `format` : 'patch', 'stat', 'name-only' ou 'name-status'.
+ */
+export function diff(state, { staged = false, paths = [], revs = [], format = 'patch' } = {}) {
   const error = requireRepo(state);
   if (error) return error;
   const repo = state.repo;
   const head = treeOf(repo, headCommitId(repo));
+  const resolved = diffRevisions(repo, revs);
+  if (resolved.error) return failure(state, resolved.error);
+  const trees = resolved.ids.map((id) => treeOf(repo, id));
   for (const path of paths) {
-    if (!hasOwn(state.workdir, path) && !hasOwn(repo.index, path) && !hasOwn(head, path)) {
+    if (![state.workdir, repo.index, head, ...trees].some((tree) => hasOwn(tree, path))) {
       return failure(state, [
         `fatal: ambiguous argument '${path}': unknown revision or path not in the working tree.`,
         "Use '--' to separate paths from revisions, like this:",
@@ -1662,18 +2059,108 @@ export function diff(state, { staged = false, paths = [] } = {}) {
       ]);
     }
   }
-  const conflicts = repo.merge?.conflicts ?? {};
+  const conflicts = conflictsOf(repo);
   const tracked = Object.fromEntries(
     keysOf(repo.index)
       .filter((p) => hasOwn(state.workdir, p))
       .map((p) => [p, state.workdir[p]]),
   );
-  const changes = (staged ? treeChanges(head, repo.index) : treeChanges(repo.index, tracked)).filter(
-    (c) => !hasOwn(conflicts, c.path) && (!paths.length || paths.includes(c.path)),
+  let before;
+  let after;
+  if (trees.length === 2) [before, after] = trees;
+  else if (trees.length === 1) [before, after] = [trees[0], staged ? repo.index : tracked];
+  else [before, after] = staged ? [head, repo.index] : [repo.index, tracked];
+  const changes = treeChanges(before, after).filter(
+    (c) => (trees.length === 2 || !hasOwn(conflicts, c.path)) && (!paths.length || paths.includes(c.path)),
   );
-  const unmerged = keysOf(conflicts).filter((p) => !paths.length || paths.includes(p));
-  const out = [...unmerged.map((p) => `* Unmerged path ${p}`), ...changes.flatMap(fileDiffLines)];
-  return success(state, out, { kind: 'diff', staged, empty: !out.length });
+  const unmerged = trees.length ? [] : keysOf(conflicts).filter((p) => !paths.length || paths.includes(p));
+  let out;
+  if (format === 'name-only') out = changes.map((c) => c.path);
+  else if (format === 'name-status') out = changes.map((c) => `${NAME_STATUS(c)}\t${c.path}`);
+  else if (format === 'stat') out = [...diffstatLines(changes), ...summaryLines(changes, { modes: false })];
+  else out = [...unmerged.map((p) => `* Unmerged path ${p}`), ...changes.flatMap(fileDiffLines)];
+  return success(state, out, { kind: 'diff', staged, empty: !out.length, revs: trees.length, format });
+}
+
+/* ------------------------------------------------------------------ git rm / check-ignore */
+
+export function rmTracked(state, { paths = [], cached = false, force = false } = {}) {
+  const error = requireRepo(state);
+  if (error) return error;
+  if (!paths.length) return failure(state, 'fatal: No pathspec was given. Which files should I remove?');
+  const repo = state.repo;
+  const conflicts = conflictsOf(repo);
+  const head = treeOf(repo, headCommitId(repo));
+  const targets = [];
+  for (const path of paths) {
+    if (!hasOwn(repo.index, path) && !hasOwn(conflicts, path))
+      return failure(state, `fatal: pathspec '${path}' did not match any files`);
+    targets.push(path);
+  }
+  if (!force) {
+    const both = [];
+    const stagedOnly = [];
+    const modified = [];
+    for (const path of targets) {
+      if (hasOwn(conflicts, path)) continue;
+      const inHead = get(head, path);
+      const inIndex = get(repo.index, path);
+      const inWorkdir = get(state.workdir, path);
+      const isStaged = inIndex !== inHead;
+      const isModified = inWorkdir !== undefined && inWorkdir !== inIndex;
+      if (cached) {
+        if (isStaged && inIndex !== inWorkdir) both.push(path);
+      } else if (isStaged && isModified) both.push(path);
+      else if (isStaged) stagedOnly.push(path);
+      else if (isModified) modified.push(path);
+    }
+    const list = (paths) => paths.map((p) => `    ${p}`);
+    const out = [];
+    if (both.length)
+      out.push(
+        `error: the following file${both.length > 1 ? 's have' : ' has'} staged content different from both the`,
+        'file and the HEAD:',
+        ...list(both),
+        '(use -f to force removal)',
+      );
+    if (stagedOnly.length)
+      out.push(
+        `error: the following file${stagedOnly.length > 1 ? 's have' : ' has'} changes staged in the index:`,
+        ...list(stagedOnly),
+        '(use --cached to keep the file, or -f to force removal)',
+      );
+    if (modified.length)
+      out.push(
+        `error: the following file${modified.length > 1 ? 's have' : ' has'} local modifications:`,
+        ...list(modified),
+        '(use --cached to keep the file, or -f to force removal)',
+      );
+    if (out.length) return failure(state, out, { kind: 'git-rm-refused' });
+  }
+  const s = clone(state);
+  for (const path of targets) {
+    delete s.repo.index[path];
+    if (!cached) delete s.workdir[path];
+    const op = s.repo.merge ?? s.repo.pick ?? s.repo.rebase;
+    if (op) delete op.conflicts[path];
+  }
+  return success(
+    s,
+    targets.map((p) => `rm '${p}'`),
+    { kind: 'git-rm', paths: targets, cached },
+  );
+}
+
+export function checkIgnore(state, { paths = [], verbose = false } = {}) {
+  const error = requireRepo(state);
+  if (error) return error;
+  if (!paths.length) return failure(state, 'fatal: no path specified');
+  const out = [];
+  for (const path of paths) {
+    const rule = hasOwn(state.repo.index, path) ? null : ignoreMatch(state.workdir, path);
+    if (rule) out.push(verbose ? `.gitignore:${rule.line}:${rule.text}\t${path}` : path);
+  }
+  return result(state, out, out.length > 0, { kind: 'check-ignore', count: out.length });
 }
 
 /* ------------------------------------------------------------------ git config */

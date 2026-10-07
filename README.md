@@ -27,6 +27,9 @@ GitHub Pages…).
 └── js/
     ├── engine.js    moteur Git simulé (état JSON, commandes pures, pile d'annulation), sans DOM
     ├── remote.js    dépôt distant simulé : remote, fetch, push, pull, clone, collègue, merge request
+    ├── rewrite.js   historique : reset, cherry-pick, revert, rebase (reprise après conflit)
+    ├── stash.js     git stash (push, list, pop, apply, drop, show, branch, clear)
+    ├── tags.js      git tag (légers et annotés)
     ├── parser.js    mini-shell : découpage de la saisie, options, sortie texte, explications
     ├── graph.js     rendu SVG du graphe (couleurs stables, étiquettes, HEAD, infobulles)
     ├── terminal.js  saisie, historique ↑/↓, autocomplétion Tab, affichage coloré
@@ -35,17 +38,29 @@ GitHub Pages…).
 
 ## Fonctionnalités
 
-- **Commandes Git** : `init`, `status` (`-s`, `-b`), `add` (`<fichier>`, `.`, `-A`), `commit`
-  (`-m`, `-a`, `-am`, `--allow-empty`), `log` (`--oneline`, `--graph`, `--all`, `-n`), `branch`
-  (liste, `-v`, création, `-d`, `-D`), `checkout` (`-b`, commit → HEAD détachée, `-- <fichier>`),
-  `switch` (`-c`, `--detach`, `-`), `merge` (avance rapide, commit de fusion, `--no-ff`,
-  `--ff-only`, conflits avec `--abort`), `diff` (`--staged`), `config` (`user.name`, `user.email`,
-  `pull.rebase`, `pull.ff`, `--list`), `help`.
-- **Dépôt distant** : `clone`, `remote` (`-v`, `add`, `remove`), `fetch` (`--all`, `--prune`),
-  `push` (`-u`, `-f`, `--delete`, refus « fetch first » / « non-fast-forward »), `pull`
-  (`--no-rebase`, `--ff-only`, refus des branches divergentes comme Git ≥ 2.34), branches de suivi
-  `origin/…`, `branch -r`, `-a`, `-vv`, `-u`, `--unset-upstream`, `checkout <branche distante>` qui
-  crée la branche locale suivie, avance et retard dans `git status`.
+- **Commandes Git** : `init`, `status` (`-s`, `-b`), `add` (`<fichier>`, `.`, `-A`, `-f`), `commit`
+  (`-m`, `-a`, `-am`, `--allow-empty`, `--amend`, `--no-edit`), `log` (`--oneline`, `--graph`,
+  `--all`, `-n`, `-- <fichier>`, `--merge`), `branch` (liste, `-v`, création, `-d`, `-D`),
+  `checkout` (`-b`, commit → HEAD détachée, `-- <fichier>`, `<commit> -- <fichier>`, `--ours`,
+  `--theirs`), `switch` (`-c`, `--detach`, `-`), `merge` (avance rapide, commit de fusion,
+  `--no-ff`, `--ff-only`, conflits avec `--abort`), `diff` (`--staged`, `<commit>`, `<a> <b>`,
+  `<a>..<b>`, `<a>...<b>`, `--stat`, `--name-only`, `--name-status`), `config` (`user.name`,
+  `user.email`, `pull.rebase`, `pull.ff`, `--list`), `help`.
+- **Corriger et réécrire l'historique** : `restore` (`--staged`, `--worktree`, `--source=<commit>`,
+  `--ours`, `--theirs`), `rm` (`--cached`, `-f`), `reset` (`--soft`, `--mixed`, `--hard`, `<fichier>`),
+  `revert` (`-n`, `-m`, `--continue`, `--skip`, `--abort`), `cherry-pick` (`-x`, `-n`, `-m`, `a..b`,
+  `--continue`, `--skip`, `--abort`), `rebase` (`<upstream>`, `<upstream> <branche>`, `--continue`,
+  `--skip`, `--abort`, conflits commit par commit, commits déjà présents en amont ignorés),
+  `stash` (`push`/`save`, `-u`, `-m`, `list`, `pop`, `apply`, `drop`, `clear`, `show [-p]`,
+  `branch`), `tag` (légers et annotés, `-l`, `-n`, `-d`, `-f`), `check-ignore [-v]` et
+  **`.gitignore`** (motifs `*`, `?`, `[…]`, `!`, `#`, à la racine : il n'y a pas de sous-dossiers).
+- **Dépôt distant** : `clone`, `remote` (`-v`, `add`, `remove`), `fetch` (`--all`, `--prune`, tags
+  récupérés automatiquement), `push` (`-u`, `-f`, `--force-with-lease`, `--delete`, `--tags`,
+  `<tag>`, refus « fetch first » / « non-fast-forward » / « stale info » / « already exists »),
+  `pull` (`--no-rebase`, `--rebase`, `--ff-only`, `pull.rebase true`, refus des branches
+  divergentes comme Git ≥ 2.34), branches de suivi `origin/…`, `branch -r`, `-a`, `-vv`, `-u`,
+  `--unset-upstream`, `checkout <branche distante>` qui crée la branche locale suivie, avance et
+  retard dans `git status`.
 - **Forge simulée** : un dépôt de démonstration (`git clone https://github.com/camille/demo.git`) ;
   toute autre URL donnée à `git remote add` crée un dépôt distant vide. Deux commandes
   pédagogiques : `collab [branche] [fichier]` (une collègue pousse un commit) et
@@ -74,18 +89,28 @@ GitHub Pages…).
 
 - L'état est un objet JSON : `workdir`, et `repo` avec `commits` (id court, hash, message,
   parents, auteur, horodatage, arbre de fichiers), `branches`, `head` (rattachée ou détachée),
-  `index`, `merge` (fusion en cours), `remotes`, `remoteRefs` (branches de suivi) et `upstreams`
-  (branche suivie par chaque branche locale). `servers` contient les dépôts distants, indexés par
-  URL : c'est la forge simulée. L'état est validé au chargement : une sauvegarde corrompue est
-  ignorée, et une sauvegarde d'une version précédente est complétée.
+  `index`, `merge`, `pick` et `rebase` (opération arrêtée sur un conflit, avec de quoi la reprendre
+  ou l'annuler), `tags` et `tagMeta` (tags annotés), `stash` (pile), `remotes`, `remoteRefs`
+  (branches de suivi) et `upstreams` (branche suivie par chaque branche locale). `servers` contient
+  les dépôts distants, indexés par URL, avec leurs branches et leurs tags : c'est la forge
+  simulée. L'état est validé au chargement : une sauvegarde corrompue est ignorée, et une
+  sauvegarde d'une version précédente est complétée.
 - Chaque commande du moteur reçoit un état et renvoie `{ state, out, ok, info }` sans modifier
   l'état reçu. L'horloge et le hasard sont injectables (`env`), ce qui rend le moteur testable
   hors navigateur. `parser.execute` intercepte toute exception : une commande invalide ne peut
   pas corrompre l'état.
-- **Commandes prévues** : `reset`, `revert`, `cherry-pick`, `stash`, `tag`, `rebase`. Elles sont
-  déclarées dans `PLANNED_COMMANDS`, l'état réserve déjà `tags` et `stash`, et le graphe sait
-  afficher des étiquettes de tag. Pour en ajouter une : écrire la fonction dans `engine.js` (ou
-  `remote.js`), puis la déclarer dans le registre `GIT` de `parser.js`.
+- **Rejouer des commits** : `rebase`, `cherry-pick` et `revert` partagent la fusion à trois voies de
+  `git merge` (`mergeTrees3` et `writeMerge` dans `engine.js`). Un rebase détache HEAD, rejoue les
+  commits un par un (même message, même auteur, même date, nouveau hash) et ne déplace la branche
+  qu'à la fin ; les anciens commits deviennent orphelins, donc transparents dans le graphe. Sur
+  un conflit, l'opération est mémorisée dans `repo.rebase` ou `repo.pick`, et `status`, `add`,
+  `commit`, `log --merge` et `checkout --ours/--theirs` s'appuient sur `conflictsOf(repo)`.
+- **Écarts connus avec Git** : un conflit au `stash pop` écrit les marqueurs dans le fichier mais le
+  laisse « modifié » dans `git status` (Git le déclare « unmerged ») ; `rebase -i`, `rebase --onto`,
+  `stash -p` et `stash --index` demandent un éditeur ou un mode interactif et ne sont pas simulés ;
+  un cherry-pick ou un revert devenu vide annule l'opération au lieu de la laisser en cours.
+- Pour ajouter une commande : écrire la fonction dans `engine.js` (ou `remote.js`, `rewrite.js`,
+  `stash.js`, `tags.js`), puis la déclarer dans le registre `GIT` de `parser.js`.
 
 ## Scénario de test (10 commandes)
 
@@ -148,3 +173,37 @@ signale des nouveautés sur `main` ; `git pull` récupère le commit de fusion
 
 Pour provoquer un push refusé : `collab`, puis un commit local, puis `git push` (« rejected …
 fetch first ») ; `git pull --no-rebase` fusionne, et `git push` passe.
+
+## Scénario de test : mettre sa branche à jour avec `rebase`
+
+Même point de départ, mais cette fois la collègue pousse sur `main` pendant que vous travaillez, et
+vous gardez un historique linéaire au lieu d'un commit de fusion.
+
+```bash
+git clone https://github.com/camille/demo.git
+git switch -c ma-feature
+echo "A" > a.txt
+git add .
+git commit -m "ajoute a"
+echo "B" > b.txt
+git add .
+git commit -m "ajoute b"
+git push -u origin ma-feature
+collab main
+git fetch
+git rebase origin/main
+git push
+git push --force-with-lease
+```
+
+Résultat attendu : `git rebase` affiche `Successfully rebased and updated refs/heads/ma-feature.` ;
+dans le graphe, deux **nouveaux** commits (« ajoute a », « ajoute b ») apparaissent après le commit
+de la collègue, et les deux anciens, encore pointés par `origin/ma-feature`, restent à côté ;
+`git status` annonce `have diverged` ; le premier `git push` est refusé (`non-fast-forward`) et
+l'explication propose `--force-with-lease`, qui passe.
+
+Pour provoquer un conflit : faites modifier `a.txt` par la collègue (`collab main a.txt`) puis
+modifiez-le aussi chez vous avant le rebase. Il s'arrête sur le commit fautif (`git status` affiche
+`interactive rebase in progress`) : corrigez le fichier (`echo "…" > a.txt`, ou
+`git checkout --theirs a.txt`), `git add a.txt`, puis `git rebase --continue`. `git rebase --abort`
+remet tout comme avant.

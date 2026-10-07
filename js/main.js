@@ -258,13 +258,45 @@ function renderRepo() {
     });
   const total = Object.keys(repo.commits).length;
   const orphans = total - reachableCommits(repo).size;
+  const operation = pendingOperation(repo);
+  const tagNames = Object.keys(repo.tags).sort();
   ui.zones.repo.replaceChildren(
     ...[
       h('p', { className: 'repo-head' }, headText),
-      repo.merge && h('p', { className: 'repo-merge' }, tag('fusion en cours', 'danger'), ` avec ${repo.merge.label}`),
+      operation && h('p', { className: 'repo-merge' }, ...operation),
       branches.length
         ? h('ul', { className: 'branch-list' }, branches)
         : placeholder(headId ? 'Aucune branche.' : `La branche ${repo.head.name} sera créée au premier commit.`),
+      tagNames.length &&
+        h(
+          'p',
+          { className: 'repo-extra' },
+          h('strong', { textContent: 'Tags : ' }),
+          ...tagNames.flatMap((name) => {
+            const badge = tag(name, 'muted');
+            const meta = repo.tagMeta[name];
+            badge.title = `${meta ? `tag annoté : ${meta.message}` : 'tag léger'} → ${repo.tags[name]}`;
+            return [badge, ' '];
+          }),
+        ),
+      repo.stash.length > 0 &&
+        h(
+          'div',
+          { className: 'repo-extra' },
+          h('strong', { textContent: `Stash (${repo.stash.length}) :` }),
+          h(
+            'ul',
+            { className: 'branch-list' },
+            repo.stash.map((entry, i) =>
+              h(
+                'li',
+                { className: 'stash-entry' },
+                h('span', { className: 'branch-name', textContent: `stash@{${i}}` }),
+                h('span', { className: 'branch-msg', textContent: entry.message }),
+              ),
+            ),
+          ),
+        ),
       h(
         'p',
         { className: 'zone-foot' },
@@ -274,6 +306,24 @@ function renderRepo() {
       ),
     ].filter(Boolean),
   );
+}
+
+/** Opération arrêtée (fusion, rebase, cherry-pick, revert) à afficher sous HEAD, ou null. */
+function pendingOperation(repo) {
+  if (repo.merge) return [tag('fusion en cours', 'danger'), ` avec ${repo.merge.label}`];
+  if (repo.rebase) {
+    const { branch, upstream, onto, step, total } = repo.rebase;
+    return [
+      tag('rebase en cours', 'danger'),
+      ` de ${branch ?? 'HEAD'} sur ${upstream ?? onto} (commit ${step}/${total})`,
+    ];
+  }
+  if (repo.pick) {
+    const { kind, id } = repo.pick;
+    const label = kind === 'revert' ? 'revert en cours' : 'cherry-pick en cours';
+    return [tag(label, 'danger'), id ? ` du commit ${id}` : ''];
+  }
+  return null;
 }
 
 /** Avance (↑ à pousser) et retard (↓ à récupérer) d'une branche sur la branche distante qu'elle suit. */

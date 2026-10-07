@@ -4,6 +4,9 @@
  */
 import * as git from './engine.js';
 import * as remote from './remote.js';
+import * as rewrite from './rewrite.js';
+import * as stash from './stash.js';
+import * as tags from './tags.js';
 
 const GIT_VERSION = '2.47.0';
 const UNSUPPORTED = 'Commande non supportée dans ce simulateur.';
@@ -12,10 +15,10 @@ const EDITORS = ['nano', 'vim', 'vi', 'emacs', 'code', 'gedit', 'notepad'];
 // Sous-commandes réelles de Git : distingue « non supportée » d'une faute de frappe.
 // prettier-ignore
 const REAL_GIT_COMMANDS = [
-  'am', 'apply', 'archive', 'bisect', 'blame', 'bundle', 'cat-file', 'citool', 'clean', 'config', 'describe',
+  'am', 'apply', 'archive', 'bisect', 'blame', 'bundle', 'cat-file', 'citool', 'clean', 'describe',
   'difftool', 'format-patch', 'fsck', 'gc', 'grep', 'gui', 'hash-object', 'ls-files', 'ls-tree', 'maintenance',
-  'mergetool', 'mv', 'notes', 'prune', 'range-diff', 'reflog', 'restore', 'rev-parse', 'rm', 'shortlog', 'show',
-  'show-ref', 'sparse-checkout', 'submodule', 'whatchanged', 'worktree', ...git.PLANNED_COMMANDS,
+  'mergetool', 'mv', 'notes', 'prune', 'range-diff', 'reflog', 'rev-parse', 'shortlog', 'show',
+  'show-ref', 'sparse-checkout', 'submodule', 'whatchanged', 'worktree',
 ];
 
 /* ------------------------------------------------------------------ résultats */
@@ -202,6 +205,32 @@ const remoteRefNames = (state) => (state.repo ? Object.keys(state.repo.remoteRef
 // `git checkout feature` crée la branche locale qui suit origin/feature : on propose donc ces noms courts.
 const remoteShortNames = (state) => remoteRefNames(state).map((ref) => ref.slice(ref.indexOf('/') + 1));
 const trackedFiles = (state) => (state.repo ? Object.keys(state.repo.index).sort() : []);
+const tagNames = (state) => (state.repo ? Object.keys(state.repo.tags).sort() : []);
+const resolves = (state, rev) => !!state.repo && git.resolveRevision(state.repo, rev) !== null;
+/** Un fichier que Git connaît ou voit : dans le répertoire de travail, l'index ou le dernier commit. */
+const knownPath = (state, path) =>
+  hasFile(state, path) ||
+  (!!state.repo &&
+    (Object.prototype.hasOwnProperty.call(state.repo.index, path) ||
+      Object.prototype.hasOwnProperty.call(git.treeOf(state.repo, git.headCommitId(state.repo)), path)));
+
+const ambiguous = (state, arg) =>
+  fail(state, [
+    `fatal: ambiguous argument '${arg}': unknown revision or path not in the working tree.`,
+    "Use '--' to separate paths from revisions, like this:",
+    "'git <command> [<revision>...] -- [<file>...]'",
+  ]);
+
+/** Sépare `git <cmd> [<rev>] <fichiers>` : la première valeur qui est une révision en est une, le reste sont des fichiers. */
+function splitRevAndPaths(state, positional, paths, dashDash) {
+  let rev = null;
+  let files = [...positional];
+  if (files.length && resolves(state, files[0]) && (dashDash || !knownPath(state, files[0]) || files.length === 1)) {
+    rev = files.shift();
+  }
+  files = [...files, ...paths];
+  return { rev, files };
+}
 const changedFiles = (state) => {
   if (!state.repo) return [];
   const st = git.computeStatus(state);
@@ -221,6 +250,30 @@ function withRemoteHint(state, first, res, verb) {
       [[`« ${first} » est une branche, pas un dépôt distant : écrivez git ${verb} ${origin} ${first}`, 'dim']],
     ],
   };
+}
+
+/** Partie commune de git cherry-pick et git revert : options de reprise (--continue…) ou nouveaux commits à rejouer. */
+function pickRun(state, kind, opts, positional, env) {
+  const actions = ['continue', 'abort', 'skip'].filter((a) => opts[a]);
+  if (actions.length > 1) return fail(state, `error: options '--${actions[0]}' and '--${actions[1]}' cannot be used together`);
+  if (actions.length) {
+    if (positional.length) return fail(state, `fatal: cannot do --${actions[0]} with commits`);
+    if (opts.continue) return rewrite.pickContinue(state, kind, env);
+    if (opts.abort) return rewrite.pickAbort(state, kind);
+    return rewrite.pickSkip(state, kind, env);
+  }
+  let mainline = null;
+  if (opts.mainline !== undefined) {
+    mainline = Number(opts.mainline);
+    if (!Number.isInteger(mainline) || mainline < 1)
+      return fail(state, "error: option `mainline' expects a number greater than zero");
+  }
+  return rewrite.pickCommits(
+    state,
+    kind,
+    { revs: positional, noCommit: !!opts.noCommit, record: !!opts.record, mainline },
+    env,
+  );
 }
 
 /**
@@ -255,70 +308,96 @@ const GIT = {
   },
   add: {
     summary: 'Add file contents to the index',
-    usage: 'git add [-A] [<pathspec>...]',
+    usage: 'git add [-A] [-f] [<pathspec>...]',
     help: [
       "Place la version actuelle des fichiers dans la staging area (l'index) : ils feront partie du prochain commit.",
-      'git add . ajoute tous les fichiers modifiés ou nouveaux.',
+      'git add . ajoute tous les fichiers modifiés ou nouveaux, sauf ceux que .gitignore ignore (-f pour les forcer).',
     ],
     examples: ['git add README.md', 'git add .'],
-    options: { A: flag('all'), all: flag('all') },
+    options: { A: flag('all'), all: flag('all'), f: flag('force'), force: flag('force') },
     complete: (state) => ['.', ...changedFiles(state)],
-    run: (state, { opts, positional, paths }) => git.add(state, { paths: [...positional, ...paths], all: !!opts.all }),
+    run: (state, { opts, positional, paths }) =>
+      git.add(state, { paths: [...positional, ...paths], all: !!opts.all, force: !!opts.force }),
   },
   commit: {
     summary: 'Record changes to the repository',
-    usage: 'git commit [-a] -m <msg>',
+    usage: 'git commit [-a] [--amend [--no-edit]] -m <msg>',
     help: [
       "Enregistre une « photo » de la staging area dans l'historique, avec un message.",
       "Option -a : indexe d'abord automatiquement les fichiers déjà suivis qui ont été modifiés.",
+      'Option --amend : remplace le dernier commit (nouveau message avec -m, ou --no-edit pour le garder) au lieu d\'en ajouter un.',
     ],
-    examples: ['git commit -m "Ajoute la page d\'accueil"', 'git commit -am "Corrige une faute"'],
+    examples: [
+      'git commit -m "Ajoute la page d\'accueil"',
+      'git commit -am "Corrige une faute"',
+      'git commit --amend -m "Message corrigé"',
+    ],
     options: {
       a: flag('all'),
       all: flag('all'),
       m: valued('message', true),
       message: valued('message', true),
       'allow-empty': flag('allowEmpty'),
+      amend: flag('amend'),
+      'no-edit': flag('noEdit'),
     },
     run: (state, { opts, positional, paths }, env) => {
       if (positional.length || paths.length)
         return unsupported(state, "Le commit de fichiers précis (git commit <fichier>) n'est pas simulé.");
       return git.commit(
         state,
-        { message: opts.message ? opts.message.join('\n\n') : null, all: !!opts.all, allowEmpty: !!opts.allowEmpty },
+        {
+          message: opts.message ? opts.message.join('\n\n') : null,
+          all: !!opts.all,
+          allowEmpty: !!opts.allowEmpty,
+          amend: !!opts.amend,
+          noEdit: !!opts.noEdit,
+        },
         env,
       );
     },
   },
   log: {
     summary: 'Show commit logs',
-    usage: 'git log [--oneline] [--graph] [--all] [-n <number>] [<revision>]',
+    usage: 'git log [--oneline] [--graph] [--all] [-n <number>] [<revision>] [-- <file>...] | git log --merge',
     help: [
       "Affiche l'historique des commits, du plus récent au plus ancien.",
       '--oneline : une ligne par commit ; --graph : dessine les branches ; --all : toutes les branches.',
+      'git log -- <fichier> : seulement les commits qui modifient ce fichier.',
+      "git log --merge : pendant un conflit, les commits des deux côtés qui touchent les fichiers en conflit.",
     ],
-    examples: ['git log --oneline --graph --all'],
+    examples: ['git log --oneline --graph --all', 'git log --oneline -- README.md', 'git log --merge'],
     options: {
       oneline: flag('oneline'),
       graph: flag('graph'),
       all: flag('all'),
       decorate: flag('decorate'),
+      merge: flag('merge'),
       n: valued('maxCount'),
       'max-count': valued('maxCount'),
     },
     numeric: 'maxCount',
-    complete: branchNames,
-    run: (state, { opts, positional, paths }) => {
-      if (paths.length) return unsupported(state, "Le filtrage de git log par fichier n'est pas simulé.");
+    complete: (state) => [...branchNames(state), ...remoteRefNames(state), ...tagNames(state), ...trackedFiles(state)],
+    run: (state, { opts, positional, paths, dashDash }) => {
       const maxCount = opts.maxCount === undefined ? Infinity : Number(opts.maxCount);
       if (!Number.isInteger(maxCount) && maxCount !== Infinity)
         return fail(state, `fatal: '${opts.maxCount}': not an integer`);
+      const revs = [];
+      const files = [...paths];
+      for (const arg of positional) {
+        if (!resolves(state, arg) && !dashDash && knownPath(state, arg)) files.push(arg);
+        else revs.push(arg);
+      }
+      if (opts.graph && (files.length || opts.merge))
+        return unsupported(state, "git log --graph n'est pas simulé avec un fichier ou --merge.");
       return git.log(state, {
         oneline: !!opts.oneline,
         graph: !!opts.graph,
         all: !!opts.all,
-        revs: positional,
+        revs,
         maxCount,
+        paths: files,
+        mergeOnly: !!opts.merge,
       });
     },
   },
@@ -366,26 +445,46 @@ const GIT = {
   },
   checkout: {
     summary: 'Switch branches or restore working tree files',
-    usage: 'git checkout [-b <new-branch>] <branch> | git checkout <commit> | git checkout -- <file>...',
+    usage:
+      'git checkout [-b <new-branch>] <branch> | git checkout <commit> | git checkout [<commit>] -- <file>... | git checkout --ours|--theirs <file>...',
     help: [
       'Déplace HEAD sur une branche (ou un commit : HEAD détachée) et met à jour le répertoire de travail.',
       "git checkout -b <nom> crée la branche et s'y place.",
-      "git checkout -- <fichier> annule les modifications non indexées d'un fichier.",
+      "git checkout -- <fichier> annule les modifications non indexées d'un fichier ; avec un commit devant (git checkout abc123 -- <fichier>), il rapporte la version de ce commit.",
+      "Pendant un conflit, git checkout --ours <fichier> garde la version de votre branche, --theirs celle de l'autre (puis git add).",
     ],
-    examples: ['git checkout feature', 'git checkout -b feature'],
-    options: { b: valued('newBranch'), detach: flag('detach') },
-    complete: (state) => [...branchNames(state), ...remoteShortNames(state), ...trackedFiles(state)],
+    examples: ['git checkout feature', 'git checkout -b feature', 'git checkout --theirs README.md'],
+    options: { b: valued('newBranch'), detach: flag('detach'), ours: flag('ours'), theirs: flag('theirs') },
+    complete: (state) => [
+      ...branchNames(state),
+      ...remoteShortNames(state),
+      ...tagNames(state),
+      ...trackedFiles(state),
+    ],
     run: (state, { opts, positional, paths, dashDash }) => {
       const newBranch = opts.newBranch ?? null;
-      if (dashDash)
-        return positional.length
-          ? unsupported(state, "La restauration depuis un autre commit n'est pas simulée.")
-          : git.checkout(state, { paths, quiet: true });
-      if (positional.length > 1) {
-        const firstIsRevision = state.repo && git.resolveRevision(state.repo, positional[0]);
-        if (newBranch === null && !firstIsRevision) return git.checkout(state, { paths: positional });
-        return unsupported(state, "La restauration depuis un autre commit n'est pas simulée.");
+      const fromRevision = (rev, files) => {
+        if (state.repo && !resolves(state, rev)) return fail(state, `fatal: invalid reference: ${rev}`);
+        const id = state.repo ? git.resolveRevision(state.repo, rev) : null;
+        return git.restorePaths(state, { paths: files, source: rev, staged: true, worktree: true, from: id });
+      };
+      if (opts.ours || opts.theirs) {
+        return git.restorePaths(state, {
+          paths: [...positional, ...paths],
+          side: opts.ours ? 'ours' : 'theirs',
+          from: 'the index',
+        });
       }
+      if (dashDash) {
+        if (positional.length > 1) return fail(state, 'fatal: only one reference expected');
+        return positional.length ? fromRevision(positional[0], paths) : git.checkout(state, { paths, quiet: true });
+      }
+      if (positional.length > 1 && newBranch === null) {
+        if (!resolves(state, positional[0])) return git.checkout(state, { paths: positional });
+        return fromRevision(positional[0], positional.slice(1));
+      }
+      if (positional.length > 1)
+        return unsupported(state, 'git checkout -b avec plusieurs arguments n\'est pas simulé.');
       return git.checkout(state, { target: positional[0] ?? null, newBranch, detach: !!opts.detach });
     },
   },
@@ -451,20 +550,36 @@ const GIT = {
   },
   diff: {
     summary: 'Show changes between commits, commit and working tree, etc',
-    usage: 'git diff [--staged] [<file>...]',
+    usage: 'git diff [--staged] [--stat | --name-only | --name-status] [<commit> [<commit>]] [-- <file>...]',
     help: [
       'Sans option : montre les modifications du répertoire de travail pas encore indexées.',
       '--staged (ou --cached) : montre ce qui est dans la staging area, prêt pour le prochain commit.',
+      'git diff <commit> : compare ce commit au répertoire de travail (git diff HEAD = tout ce qui a changé depuis le dernier commit).',
+      'git diff <a> <b> (ou <a>..<b>) : compare deux commits ou deux branches ; --stat résume, --name-only liste les fichiers.',
     ],
-    examples: ['git diff', 'git diff --staged'],
-    options: { staged: flag('staged'), cached: flag('staged') },
-    complete: trackedFiles,
-    run: (state, { opts, positional, paths }) => {
-      const files = [...positional, ...paths];
-      const isRevision = (p) => state.repo && !hasFile(state, p) && git.resolveRevision(state.repo, p);
-      if (positional.some(isRevision))
-        return unsupported(state, "La comparaison entre commits (git diff <commit>) n'est pas simulée.");
-      return git.diff(state, { staged: !!opts.staged, paths: files });
+    examples: ['git diff', 'git diff --staged', 'git diff HEAD', 'git diff main feature', 'git diff --stat main..feature'],
+    options: {
+      staged: flag('staged'),
+      cached: flag('staged'),
+      stat: flag('stat'),
+      'name-only': flag('nameOnly'),
+      'name-status': flag('nameStatus'),
+    },
+    complete: (state) => [...trackedFiles(state), ...branchNames(state), ...remoteRefNames(state), ...tagNames(state)],
+    run: (state, { opts, positional, paths, dashDash }) => {
+      const revs = [];
+      const files = [...paths];
+      const isRevision = (arg) => {
+        const range = /^(.*?)(\.{2,3})(.*)$/.exec(arg);
+        if (range) return [range[1] || 'HEAD', range[3] || 'HEAD'].every((part) => resolves(state, part));
+        return !hasFile(state, arg) && resolves(state, arg);
+      };
+      for (const arg of positional) {
+        if (!dashDash && files.length === 0 && revs.length < 2 && isRevision(arg)) revs.push(arg);
+        else files.push(arg);
+      }
+      const format = opts.stat ? 'stat' : opts.nameOnly ? 'name-only' : opts.nameStatus ? 'name-status' : 'patch';
+      return git.diff(state, { staged: !!opts.staged, paths: files, revs, format });
     },
   },
   config: {
@@ -571,12 +686,12 @@ const GIT = {
   },
   pull: {
     summary: 'Fetch from and integrate with another repository or a local branch',
-    usage: 'git pull [--ff-only] [--no-rebase] [<remote> [<branch>]]',
+    usage: 'git pull [--ff-only] [--no-rebase | --rebase] [<remote> [<branch>]]',
     help: [
       'Récupère les commits du dépôt distant (git fetch) puis les fusionne dans la branche courante (git merge).',
-      'Si votre branche et la branche distante ont chacune des commits nouveaux, Git demande comment réconcilier : ajoutez --no-rebase pour fusionner.',
+      'Si votre branche et la branche distante ont chacune des commits nouveaux, Git demande comment réconcilier : --no-rebase fusionne (commit de fusion), --rebase rejoue vos commits par-dessus ceux du distant (historique linéaire).',
     ],
-    examples: ['git pull', 'git pull --no-rebase'],
+    examples: ['git pull', 'git pull --no-rebase', 'git pull --rebase'],
     options: {
       'ff-only': flag('ffOnly'),
       'no-rebase': flag('noRebase'),
@@ -590,8 +705,6 @@ const GIT = {
         ? [...branchNames(state), ...remoteShortNames(state)]
         : remoteNames(state),
     run: (state, { opts, positional }, env) => {
-      if (opts.rebase)
-        return unsupported(state, 'git pull --rebase repose sur git rebase, prévu dans une prochaine version.');
       if (positional.length > 2) return unsupported(state, "Le pull de plusieurs branches n'est pas simulé.");
       const res = remote.pull(
         state,
@@ -601,6 +714,7 @@ const GIT = {
           ffOnly: !!opts.ffOnly,
           noRebase: !!opts.noRebase,
           noFF: !!opts.noFF,
+          rebase: !!opts.rebase,
         },
         env,
       );
@@ -609,22 +723,26 @@ const GIT = {
   },
   push: {
     summary: 'Update remote refs along with associated objects',
-    usage: 'git push [-u] [-f] [<remote> [<branch>]] | git push <remote> --delete <branch>',
+    usage: 'git push [-u] [-f | --force-with-lease] [<remote> [<branch> | <tag>]] | git push <remote> --tags | git push <remote> --delete <branch>',
     help: [
       "Envoie vos commits vers le dépôt distant. Le push est refusé si le dépôt distant contient des commits que vous n'avez pas : faites d'abord git pull.",
-      '-u (--set-upstream) mémorise la branche distante à suivre : ensuite, git push et git pull suffisent. --delete supprime une branche distante.',
+      '-u (--set-upstream) mémorise la branche distante à suivre : ensuite, git push et git pull suffisent. --delete supprime une branche (ou un tag) distant.',
+      "Un tag n'est pas envoyé avec les branches : git push origin <tag> (ou --tags pour tous).",
+      "Après un rebase ou un amend, l'historique local a été réécrit : le push est refusé, il faut --force-with-lease (--force est plus brutal : il écrase sans vérifier).",
     ],
-    examples: ['git push -u origin main', 'git push', 'git push origin --delete feature'],
+    examples: ['git push -u origin main', 'git push', 'git push origin v1.0', 'git push --force-with-lease'],
     options: {
       u: flag('setUpstream'),
       'set-upstream': flag('setUpstream'),
       f: flag('force'),
       force: flag('force'),
+      'force-with-lease': flag('forceLease'),
       d: flag('delete'),
       delete: flag('delete'),
+      tags: flag('tags'),
     },
     complete: (state, args) =>
-      args.filter((a) => !a.startsWith('-')).length ? branchNames(state) : remoteNames(state),
+      args.filter((a) => !a.startsWith('-')).length ? [...branchNames(state), ...tagNames(state)] : remoteNames(state),
     run: (state, { opts, positional }) =>
       withRemoteHint(
         state,
@@ -634,10 +752,302 @@ const GIT = {
           refspecs: positional.slice(1),
           setUpstream: !!opts.setUpstream,
           force: !!opts.force,
+          forceLease: !!opts.forceLease,
           del: !!opts.delete,
+          tags: !!opts.tags,
         }),
         'push',
       ),
+  },
+  tag: {
+    summary: 'Create, list, delete or verify a tag object signed with GPG',
+    usage: 'git tag [-l [<pattern>]] [-n] | git tag [-a] [-m <msg>] [-f] <name> [<commit>] | git tag -d <name>...',
+    help: [
+      'Pose un nom durable (v1.0…) sur un commit, pour marquer une version. Contrairement à une branche, un tag ne bouge pas.',
+      'Sans option : liste les tags. -a (ou -m) crée un tag annoté, avec message, auteur et date ; sinon le tag est « léger ».',
+      '-d supprime un tag en local. Les tags ne partent pas avec git push : git push origin <tag> (ou --tags).',
+    ],
+    examples: ['git tag v1.0', 'git tag -a v1.1 -m "Version 1.1"', 'git push origin v1.1', 'git tag -d v1.0'],
+    options: {
+      a: flag('annotate'),
+      annotate: flag('annotate'),
+      m: valued('message', true),
+      message: valued('message', true),
+      d: flag('delete'),
+      delete: flag('delete'),
+      l: flag('list'),
+      list: flag('list'),
+      f: flag('force'),
+      force: flag('force'),
+      n: flag('annotations'),
+    },
+    complete: (state) => [...tagNames(state), ...branchNames(state)],
+    run: (state, { opts, positional }, env) => {
+      if (opts.delete) return tags.tagDelete(state, { names: positional });
+      const creating = positional.length && !opts.list;
+      if (!creating && !opts.annotate && opts.message === undefined) {
+        return tags.tagList(state, { pattern: positional[0] ?? null, annotations: !!opts.annotations });
+      }
+      if (positional.length === 0) return fail(state, ['fatal: tag name required']);
+      if (positional.length > 2) return fail(state, 'fatal: too many arguments');
+      return tags.tagCreate(
+        state,
+        {
+          name: positional[0],
+          target: positional[1] ?? null,
+          message: opts.message ? opts.message.join('\n\n') : null,
+          annotate: !!(opts.annotate || opts.message),
+          force: !!opts.force,
+        },
+        env,
+      );
+    },
+  },
+  stash: {
+    summary: 'Stash the changes in a dirty working directory away',
+    usage:
+      'git stash [push] [-u] [-m <msg>] | git stash list | git stash pop|apply|drop [<stash>] | git stash show [-p] [<stash>] | git stash branch <name> [<stash>] | git stash clear',
+    help: [
+      "Met de côté les modifications en cours (fichiers suivis modifiés, staging area) et remet le répertoire de travail dans l'état du dernier commit. Pratique avant de changer de branche ou de faire un pull.",
+      'git stash pop reprend la dernière mise de côté et la supprime de la pile ; git stash apply la reprend sans la supprimer.',
+      '-u inclut aussi les fichiers non suivis ; git stash list affiche la pile (stash@{0} est le plus récent).',
+    ],
+    examples: ['git stash', 'git stash -u -m "essai"', 'git stash list', 'git stash pop'],
+    options: {
+      u: flag('untracked'),
+      'include-untracked': flag('untracked'),
+      m: valued('message'),
+      message: valued('message'),
+      p: flag('patch'),
+      patch: flag('patch'),
+      k: flag('keepIndex'),
+      'keep-index': flag('keepIndex'),
+      a: flag('all'),
+      all: flag('all'),
+      index: flag('index'),
+    },
+    complete: (state, args) => {
+      const sub = args.filter((a) => !a.startsWith('-'));
+      if (!sub.length) return ['push', 'list', 'pop', 'apply', 'drop', 'show', 'branch', 'clear'];
+      const entries = (state.repo?.stash ?? []).map((_, i) => `stash@{${i}}`);
+      return ['pop', 'apply', 'drop', 'show'].includes(sub[0]) ? entries : [];
+    },
+    run: (state, { opts, positional, paths }, env) => {
+      const [action, ...args] = positional;
+      if (opts.keepIndex || opts.all)
+        return unsupported(state, "Les options --keep-index et --all de git stash ne sont pas simulées.");
+      switch (action) {
+        case undefined:
+        case 'push':
+        case 'save': {
+          if (opts.patch)
+            return unsupported(state, "git stash -p est interactif : il demande un choix pour chaque morceau de fichier.");
+          if (paths.length || (action === 'push' && args.length))
+            return unsupported(state, "Mettre de côté seulement certains fichiers n'est pas simulé.");
+          const message = action === 'save' ? args.join(' ') || null : (opts.message ?? null);
+          return stash.stashPush(state, { message, includeUntracked: !!opts.untracked }, env);
+        }
+        case 'list':
+          return stash.stashList(state);
+        case 'pop':
+        case 'apply':
+          if (opts.index) return unsupported(state, "L'option --index de git stash n'est pas simulée.");
+          return stash.stashApply(state, { ref: args[0] ?? null, pop: action === 'pop' });
+        case 'drop':
+          return stash.stashDrop(state, { ref: args[0] ?? null });
+        case 'clear':
+          return stash.stashClear(state);
+        case 'show':
+          return stash.stashShow(state, { ref: args[0] ?? null, patch: !!opts.patch });
+        case 'branch':
+          return stash.stashBranch(state, { name: args[0] ?? null, ref: args[1] ?? null });
+        default:
+          return fail(state, [
+            `error: unknown subcommand: ${action}`,
+            'usage: git stash list [<log-options>]',
+            '   or: git stash show [<diff-options>] [<stash>]',
+            '   or: git stash drop [-q | --quiet] [<stash>]',
+            '   or: git stash pop [--index] [-q | --quiet] [<stash>]',
+            '   or: git stash push [-m | --message <message>] [-u]',
+          ]);
+      }
+    },
+  },
+  reset: {
+    summary: 'Reset current HEAD to the specified state',
+    usage: 'git reset [--soft | --mixed | --hard] [<commit>] | git reset [<commit>] [--] <file>...',
+    help: [
+      "Déplace la branche courante sur un autre commit (HEAD~1 = le précédent). Les trois modes décident de ce qui arrive à la staging area et aux fichiers :",
+      '--soft : seule la branche bouge ; les modifications restent dans la staging area. --mixed (défaut) : la staging area est aussi remise à zéro, les fichiers gardent leurs modifications.',
+      '--hard : tout est remis dans l\'état du commit visé, les modifications non commitées sont PERDUES.',
+      'git reset <fichier> sort simplement un fichier de la staging area (l\'inverse de git add).',
+    ],
+    examples: ['git reset HEAD~1', 'git reset --soft HEAD~1', 'git reset --hard origin/main', 'git reset README.md'],
+    options: {
+      soft: flag('soft'),
+      mixed: flag('mixed'),
+      hard: flag('hard'),
+      q: flag('quiet'),
+      quiet: flag('quiet'),
+    },
+    complete: (state) => [...branchNames(state), ...remoteRefNames(state), ...tagNames(state), ...trackedFiles(state)],
+    run: (state, { opts, positional, paths, dashDash }) => {
+      const modes = ['soft', 'mixed', 'hard'].filter((m) => opts[m]);
+      if (modes.length > 1) return fail(state, `fatal: options '--${modes[0]}' and '--${modes[1]}' cannot be used together`);
+      if (positional.length > 1 && dashDash) return fail(state, 'fatal: only one revision expected');
+      const { rev, files } = splitRevAndPaths(state, positional, paths, dashDash);
+      if (!dashDash) {
+        const unknown = files.find((f) => !knownPath(state, f));
+        if (unknown !== undefined) return ambiguous(state, unknown);
+      }
+      return rewrite.reset(state, { mode: modes[0] ?? 'mixed', target: rev, paths: files });
+    },
+  },
+  revert: {
+    summary: 'Revert some existing commits',
+    usage: 'git revert [--no-edit] [-n] [-m <parent>] <commit>... | git revert --continue | --skip | --abort',
+    help: [
+      "Crée un NOUVEAU commit qui annule les modifications d'un ancien commit. L'historique n'est pas réécrit : c'est la bonne façon de défaire un commit déjà poussé.",
+      "-n applique l'annulation sans commiter. -m 1 est nécessaire pour annuler un commit de fusion (1 = on garde le côté de la branche courante).",
+      "En cas de conflit : corrigez, git add, puis git revert --continue (ou --skip, --abort). Le simulateur n'ouvre pas d'éditeur : le message par défaut est utilisé.",
+    ],
+    examples: ['git revert HEAD', 'git revert abc1234 --no-edit', 'git revert -m 1 <commit-de-fusion>'],
+    options: {
+      'no-edit': flag('noEdit'),
+      n: flag('noCommit'),
+      'no-commit': flag('noCommit'),
+      m: valued('mainline'),
+      mainline: valued('mainline'),
+      continue: flag('continue'),
+      abort: flag('abort'),
+      skip: flag('skip'),
+    },
+    complete: (state) => [...branchNames(state), ...tagNames(state), 'HEAD', 'HEAD~1'],
+    run: (state, { opts, positional }, env) => pickRun(state, 'revert', opts, positional, env),
+  },
+  'cherry-pick': {
+    summary: 'Apply the changes introduced by some existing commits',
+    usage:
+      'git cherry-pick [-x] [-n] [-m <parent>] <commit>... | git cherry-pick <a>..<b> | git cherry-pick --continue | --skip | --abort',
+    help: [
+      "Copie un ou plusieurs commits (et seulement eux) sur la branche courante : mêmes modifications, mais nouveaux commits avec de nouveaux hash.",
+      '-x ajoute « (cherry picked from commit …) » au message ; -n applique sans commiter ; a..b copie les commits après a jusqu\'à b.',
+      "En cas de conflit : corrigez, git add, puis git cherry-pick --continue (ou --skip, --abort).",
+    ],
+    examples: ['git cherry-pick abc1234', 'git cherry-pick -x feature~1', 'git cherry-pick main..feature'],
+    options: {
+      x: flag('record'),
+      n: flag('noCommit'),
+      'no-commit': flag('noCommit'),
+      m: valued('mainline'),
+      mainline: valued('mainline'),
+      continue: flag('continue'),
+      abort: flag('abort'),
+      skip: flag('skip'),
+    },
+    complete: (state) => [...branchNames(state), ...remoteRefNames(state), ...tagNames(state)],
+    run: (state, { opts, positional }, env) => pickRun(state, 'cherry-pick', opts, positional, env),
+  },
+  rebase: {
+    summary: 'Reapply commits on top of another base tip',
+    usage: 'git rebase <upstream> [<branch>] | git rebase --continue | --skip | --abort',
+    help: [
+      "Rejoue les commits de votre branche (ceux que <upstream> n'a pas) par-dessus <upstream> : l'historique devient linéaire, sans commit de fusion. Les commits rejoués sont de NOUVEAUX commits (nouveaux hash) ; les anciens deviennent orphelins.",
+      "Typiquement : git rebase origin/main sur une branche de travail pour la mettre à jour. Ne réécrivez jamais des commits déjà partagés : le push suivant exigera --force-with-lease.",
+      "En cas de conflit, le rebase s'arrête sur le commit fautif : corrigez, git add, puis git rebase --continue (ou --skip pour l'ignorer, --abort pour tout annuler).",
+    ],
+    examples: ['git rebase main', 'git rebase origin/main', 'git rebase --continue', 'git rebase --abort'],
+    options: {
+      continue: flag('continue'),
+      abort: flag('abort'),
+      skip: flag('skip'),
+      i: flag('interactive'),
+      interactive: flag('interactive'),
+    },
+    complete: (state) => [...branchNames(state), ...remoteRefNames(state), ...tagNames(state)],
+    run: (state, { opts, positional }, env) => {
+      if (opts.interactive)
+        return unsupported(state, "Le mode interactif (-i) demande un éditeur de texte, absent du simulateur.");
+      if (opts.abort) return rewrite.rebaseAbort(state);
+      if (opts.continue) return rewrite.rebaseContinue(state, env);
+      if (opts.skip) return rewrite.rebaseSkip(state, env);
+      if (positional.length > 2) return fail(state, 'usage: git rebase [<options>] [<upstream> [<branch>]]');
+      if (positional.length === 2) {
+        const switched = git.switchBranch(state, { target: positional[1] });
+        if (!switched.ok) return switched;
+        const res = rewrite.rebase(switched.state, { upstream: positional[0] }, env);
+        return { ...res, out: [...switched.out, ...res.out] };
+      }
+      return rewrite.rebase(state, { upstream: positional[0] ?? null }, env);
+    },
+  },
+  restore: {
+    summary: 'Restore working tree files',
+    usage:
+      'git restore [--staged] [--worktree] [--source=<commit>] <file>... | git restore --ours|--theirs <file>...',
+    help: [
+      'Remet des fichiers dans un état précédent. Sans option : le fichier retrouve sa version de la staging area (modifications non indexées abandonnées).',
+      "--staged : sort le fichier de la staging area (il garde ses modifications). --source=<commit> : prend la version de ce commit (HEAD~1, une branche, un tag…).",
+      "Pendant un conflit, --ours garde la version de votre branche, --theirs celle de l'autre.",
+    ],
+    examples: ['git restore README.md', 'git restore --staged README.md', 'git restore --source=HEAD~2 README.md'],
+    options: {
+      S: flag('staged'),
+      staged: flag('staged'),
+      W: flag('worktree'),
+      worktree: flag('worktree'),
+      s: valued('source'),
+      source: valued('source'),
+      ours: flag('ours'),
+      theirs: flag('theirs'),
+    },
+    complete: (state) => [...trackedFiles(state), ...changedFiles(state)],
+    run: (state, { opts, positional, paths }) => {
+      const files = [...positional, ...paths];
+      if (!files.length) return fail(state, 'fatal: you must specify path(s) to restore');
+      return git.restorePaths(state, {
+        paths: files,
+        source: opts.source ?? null,
+        staged: !!opts.staged,
+        worktree: !!opts.worktree || !opts.staged,
+        side: opts.ours ? 'ours' : opts.theirs ? 'theirs' : null,
+      });
+    },
+  },
+  rm: {
+    summary: 'Remove files from the working tree and from the index',
+    usage: 'git rm [--cached] [-f] [-r] <file>...',
+    help: [
+      'Supprime un fichier suivi : il disparaît du répertoire de travail ET sera supprimé au prochain commit.',
+      '--cached ne retire le fichier que de la staging area : il reste sur le disque mais n\'est plus suivi (utile avec .gitignore).',
+      '-f force la suppression malgré des modifications non commitées.',
+    ],
+    examples: ['git rm vieux.txt', 'git rm --cached secret.env'],
+    options: {
+      cached: flag('cached'),
+      f: flag('force'),
+      force: flag('force'),
+      r: flag('recursive'),
+      q: flag('quiet'),
+      quiet: flag('quiet'),
+    },
+    complete: trackedFiles,
+    run: (state, { opts, positional, paths }) => {
+      const res = git.rmTracked(state, { paths: [...positional, ...paths], cached: !!opts.cached, force: !!opts.force });
+      return opts.quiet && res.ok ? { ...res, out: [] } : res;
+    },
+  },
+  'check-ignore': {
+    summary: 'Debug gitignore / exclude files',
+    usage: 'git check-ignore [-v] <path>...',
+    help: [
+      'Indique si un fichier est ignoré par .gitignore (il affiche le chemin si oui, rien sinon). -v montre la ligne de .gitignore responsable.',
+    ],
+    examples: ['git check-ignore -v debug.log'],
+    options: { v: flag('verbose'), verbose: flag('verbose') },
+    complete: (state) => Object.keys(state.workdir).sort(),
+    run: (state, { opts, positional, paths }) =>
+      git.checkIgnore(state, { paths: [...positional, ...paths], verbose: !!opts.verbose }),
   },
   help: {
     summary: 'Display help information about Git',
@@ -651,9 +1061,12 @@ const GIT = {
 
 const HELP_GROUPS = [
   ['start a working area (see also: git help tutorial)', ['clone', 'init']],
-  ['work on the current change (see also: git help everyday)', ['add']],
+  ['work on the current change (see also: git help everyday)', ['add', 'restore', 'rm', 'stash']],
   ['examine the history and state (see also: git help revisions)', ['diff', 'log', 'status']],
-  ['grow, mark and tweak your common history', ['branch', 'checkout', 'commit', 'merge', 'switch']],
+  [
+    'grow, mark and tweak your common history',
+    ['branch', 'checkout', 'cherry-pick', 'commit', 'merge', 'rebase', 'reset', 'revert', 'switch', 'tag'],
+  ],
   ['collaborate (see also: git help workflows)', ['fetch', 'pull', 'push']],
 ];
 
@@ -674,13 +1087,7 @@ function gitUsageLines() {
 function gitHelp(state, topic) {
   if (!topic) return ok(state, gitUsageLines(), { kind: 'help' });
   const def = GIT[topic];
-  if (!def) {
-    if (git.PLANNED_COMMANDS.includes(topic))
-      return ok(state, [
-        [[`git ${topic} n'est pas encore simulée : elle est prévue dans une prochaine version.`, 'dim']],
-      ]);
-    return fail(state, `No manual entry for git${topic}`);
-  }
+  if (!def) return fail(state, `No manual entry for git${topic}`);
   const out = [
     [[`GIT-${topic.toUpperCase()}`, 'bold']],
     '',
@@ -732,12 +1139,7 @@ function runGit(state, args, env) {
   if (name === '--help' || name === '-h') return gitHelp(state, rest[0]);
   if (name.startsWith('-')) return unsupported(state, `L'option globale « ${name} » n'est pas simulée.`);
   const def = GIT[name];
-  if (!def) {
-    if (git.PLANNED_COMMANDS.includes(name))
-      return unsupported(state, `git ${name} est prévue pour une prochaine version du simulateur.`);
-    if (REAL_GIT_COMMANDS.includes(name)) return unsupported(state);
-    return notAGitCommand(state, name);
-  }
+  if (!def) return REAL_GIT_COMMANDS.includes(name) ? unsupported(state) : notAGitCommand(state, name);
   if (rest.includes('-h')) return ok(state, [`usage: ${def.usage}`]);
   const parsed = parseOptions(rest, def);
   if (parsed.unsupported)
@@ -782,12 +1184,22 @@ const SHELL_HELP = [
   '  git checkout [-b] <branche> change de branche (ou crée et change)',
   '  git switch [-c] <branche>   change de branche (version moderne)',
   '  git merge <branche>         fusionne une branche dans la branche courante',
-  '  git diff [--staged]         montre les modifications',
+  '  git diff [--staged] [a [b]] montre les modifications (ou compare deux commits / branches)',
+  '  git restore [--staged] <fichier>  annule des modifications ; --source=<commit> prend une ancienne version',
+  '  git rm [--cached] <fichier> supprime un fichier suivi (ou ne le suit plus)',
+  '  git commit --amend          remplace le dernier commit',
+  '  git reset [--soft|--hard] [commit]  déplace la branche ; git reset <fichier> désindexe',
+  '  git revert <commit>         nouveau commit qui annule un ancien commit',
+  '  git cherry-pick <commit>    copie un commit sur la branche courante',
+  '  git rebase <branche>        rejoue vos commits par-dessus une autre branche',
+  '  git stash [pop|list|drop]   met de côté les modifications en cours',
+  '  git tag [-a] [nom] [commit] liste ou crée des tags (git push origin <tag> pour les envoyer)',
+  '  .gitignore                  les fichiers listés ne sont plus proposés par git status / git add .',
   '  git config --global user.name "Prénom Nom"  (et user.email, --list)',
   '  git clone <url>             copie un dépôt distant (essayez le dépôt de démonstration)',
   '  git remote [-v] | add <nom> <url> | remove <nom>',
   '  git fetch [remote]          télécharge les nouveautés sans fusionner',
-  '  git pull [remote] [branche] fetch + merge ; git push [-u] [remote] [branche]',
+  '  git pull [--rebase] [remote] [branche]  fetch + merge (ou rebase) ; git push [-u] [--force-with-lease] [remote] [branche|tag]',
   "  git help [commande]         aide d'une commande",
   '',
   [['Collègue simulé', 'bold']],
@@ -901,9 +1313,18 @@ export function execute(state, input, env = git.defaultEnv) {
     }
     current = res.state;
     lastOk = res.ok;
-    entries.push({ out: res.out, ok: res.ok, explanation: explain(res.info) });
+    entries.push({ out: res.out, ok: res.ok, explanation: safeExplain(res.info) });
   }
   return { state: current, entries };
+}
+
+/** Une phrase d'explication manquante vaut mieux qu'une commande qui plante. */
+function safeExplain(info) {
+  try {
+    return explain(info);
+  } catch {
+    return null;
+  }
 }
 
 function redirect(res, { file, append }) {
@@ -927,7 +1348,13 @@ export function explain(info) {
     case 'nothing-to-commit':
       return "Rien n'a été commité : un commit ne contient que ce qui est dans la staging area, ajoutez-y vos fichiers avec git add.";
     case 'no-editor':
-      return 'Ce simulateur n\'ouvre pas d\'éditeur de texte : donnez le message directement avec git commit -m "votre message".';
+      return info.amend
+        ? 'Ce simulateur n\'ouvre pas d\'éditeur : gardez le message avec git commit --amend --no-edit, ou donnez-en un nouveau avec git commit --amend -m "…".'
+        : 'Ce simulateur n\'ouvre pas d\'éditeur de texte : donnez le message directement avec git commit -m "votre message".';
+    case 'tag-no-editor':
+      return 'Un tag annoté a besoin d\'un message, et ce simulateur n\'ouvre pas d\'éditeur : git tag -a v1.0 -m "Version 1.0".';
+    case 'add-ignored':
+      return `${list(info.paths)} correspond à un motif de .gitignore : Git refuse de l'ajouter par erreur. git add -f force l'ajout, ou retirez le motif de .gitignore.`;
     case 'init':
       return info.reinit
         ? "Le dépôt existait déjà : git init n'a rien effacé."
@@ -935,11 +1362,19 @@ export function explain(info) {
     case 'status':
       return 'git status compare le dernier commit, la staging area et le répertoire de travail, sans rien modifier.';
     case 'add':
-      if (info.resolved.length)
-        return `Conflit marqué comme résolu pour ${list(info.resolved)} : une fois tous les conflits résolus, git commit crée le commit de fusion.`;
+      if (info.resolved.length) {
+        const next =
+          info.op === 'rebase' || info.op === 'cherry-pick' || info.op === 'revert'
+            ? `git ${info.op} --continue reprend l'opération`
+            : 'git commit crée le commit de fusion';
+        return `Conflit marqué comme résolu pour ${list(info.resolved)} : une fois tous les conflits résolus, ${next}.`;
+      }
       if (!info.staged.length) return 'Rien de nouveau : la staging area contenait déjà cette version des fichiers.';
       return `Les modifications de ${list(info.staged)} sont maintenant dans la staging area : elles feront partie du prochain commit.`;
     case 'commit':
+      if (info.amend) {
+        return `Le dernier commit a été remplacé par ${info.id} : même place dans l'historique (parent ${info.parent ?? 'aucun'}), mais un nouveau hash. L'ancien commit ${info.old} n'est plus pointé par la branche (orphelin) : si vous l'aviez déjà poussé, le push sera refusé.`;
+      }
       if (info.merged)
         return `Commit de fusion ${info.id} créé : il a deux parents et termine la fusion de ${info.merged}.`;
       if (!info.branch)
@@ -950,6 +1385,9 @@ export function explain(info) {
         return `L'option -a a d'abord indexé ${list(info.autoStaged)}, puis le commit ${info.id} a été ajouté sur ${info.branch} à la suite de ${info.parent}.`;
       return `Commit ${info.id} créé : Git a enregistré une photo de la staging area et ${info.branch} avance d'un cran (parent : ${info.parent}).`;
     case 'log':
+      if (info.mergeOnly)
+        return 'git log --merge ne garde que les commits des deux côtés du conflit qui touchent les fichiers en conflit : ce sont eux qui expliquent qui a changé quoi.';
+      if (info.files) return "git log -- <fichier> ne garde que les commits qui modifient ce fichier.";
       return info.graph
         ? "git log --graph dessine l'historique : chaque * est un commit, les traits montrent les bifurcations et les fusions."
         : "git log parcourt l'historique depuis HEAD, du commit le plus récent au plus ancien, en remontant les parents.";
@@ -978,10 +1416,19 @@ export function explain(info) {
       return `Vous êtes déjà sur ${info.branch} : rien n'a changé.`;
     case 'detach':
       return `HEAD est détachée : elle pointe directement sur le commit ${info.id} et non sur une branche, les nouveaux commits n'appartiendraient à aucune branche.`;
-    case 'restore':
-      return info.paths.length
-        ? `${list(info.paths)} a retrouvé sa version de la staging area : les modifications non indexées ont été abandonnées.`
-        : 'Rien à restaurer : les fichiers étaient déjà identiques à la staging area.';
+    case 'restore': {
+      const from = info.source ? `du commit ${info.source}` : info.staged ? 'de HEAD' : 'de la staging area';
+      if (!info.paths.length) return `Rien à restaurer : les fichiers étaient déjà identiques à la version ${from}.`;
+      if (info.side) {
+        const which = info.side === 'ours' ? 'de votre branche (ours)' : "de l'autre branche (theirs)";
+        return `${list(info.paths)} a pris la version ${which} : le conflit n'est pas résolu pour autant, terminez avec git add.`;
+      }
+      if (info.staged && !info.worktree)
+        return `${list(info.paths)} sort de la staging area (retour à la version ${from}) : le fichier garde ses modifications mais ne fera plus partie du prochain commit.`;
+      if (info.staged)
+        return `${list(info.paths)} a retrouvé la version ${from}, dans la staging area comme dans le répertoire de travail.`;
+      return `${list(info.paths)} a retrouvé sa version ${from} : les modifications non indexées ont été abandonnées.`;
+    }
     case 'merge-ff':
       return info.from
         ? `Avance rapide (fast-forward) : ${info.into ?? 'HEAD'} n'avait pas divergé, son étiquette a simplement avancé jusqu'à ${info.to} sans créer de commit.`
@@ -1016,9 +1463,19 @@ export function explain(info) {
         ? 'Les branches de suivi ont été mises à jour ; aucun nouveau commit à télécharger.'
         : `Rien de nouveau sur ${info.remote} : vos branches de suivi étaient déjà à jour.`;
     case 'push':
-      if (info.rejected === 'fetch first' || info.rejected === 'non-fast-forward') {
+      if (info.rejected === 'fetch first') {
         return `Push refusé : ${info.remote} contient des commits que vous n'avez pas. Récupérez-les d'abord avec git pull, puis poussez à nouveau.`;
       }
+      if (info.rejected === 'non-fast-forward') {
+        return `Push refusé : votre branche et ${info.remote} ont divergé. Si c'est parce que vous avez réécrit l'historique (rebase, amend, reset), poussez avec git push --force-with-lease ; sinon intégrez d'abord les commits distants avec git pull.`;
+      }
+      if (info.rejected === 'stale info')
+        return `--force-with-lease a refusé d'écraser ${info.remote} : quelqu'un y a poussé depuis votre dernier fetch. Faites git fetch, regardez ce qui est arrivé, puis réessayez.`;
+      if (info.rejected === 'already exists')
+        return `Un tag du même nom existe déjà sur ${info.remote} avec un autre contenu : un tag publié ne doit pas bouger. Choisissez un nouveau nom (ou --force si vous savez ce que vous faites).`;
+      if (info.deletedTags?.length) return `Le tag ${list(info.deletedTags)} a été supprimé sur ${info.remote}.`;
+      if (info.tags?.length)
+        return `Le tag ${list(info.tags)} est maintenant sur ${info.remote} : les tags ne partent jamais avec un simple git push, il faut les envoyer explicitement.`;
       if (info.deleted.length) return `La branche ${list(info.deleted)} a été supprimée sur ${info.remote}.`;
       if (info.created.length) {
         return `git push a envoyé vos commits : la branche ${list(info.created)} existe maintenant sur ${info.remote}, et ${info.remote}/${info.created[0]} la représente en local.`;
@@ -1043,12 +1500,20 @@ export function explain(info) {
           return `git pull : ${got} ; votre branche contient déjà tout ${info.remote}/${info.branch}.`;
         case 'merge-conflict':
           return explain(info.merge);
+        case 'rebase':
+          return `git pull --rebase = git fetch + git rebase : ${got}, puis ${
+            info.merge.ff
+              ? `votre branche a simplement avancé jusqu'à ${info.remote}/${info.branch}`
+              : `vos ${plural(info.merge.count, 'commit')} ${info.merge.count > 1 ? 'ont été rejoués' : 'a été rejoué'} par-dessus : l'historique reste linéaire, sans commit de fusion`
+          }.`;
+        case 'rebase-conflict':
+          return explain(info.merge);
         default:
           return null;
       }
     }
     case 'pull-divergent':
-      return `Votre branche et ${info.ref} ont chacune des commits que l'autre n'a pas. Pour les fusionner : git pull --no-rebase (ou une fois pour toutes : git config pull.rebase false).`;
+      return `Votre branche et ${info.ref} ont chacune des commits que l'autre n'a pas. Pour les fusionner : git pull --no-rebase (commit de fusion), ou git pull --rebase (vos commits sont rejoués par-dessus ceux du distant). Une fois pour toutes : git config pull.rebase false (ou true).`;
     case 'pull-no-tracking':
       return 'Cette branche ne suit aucune branche distante : précisez-la (git pull origin main) ou poussez-la avec git push -u.';
     case 'branch-upstream':
@@ -1062,10 +1527,103 @@ export function explain(info) {
     case 'mr-conflict':
       return 'La forge ne sait pas résoudre un conflit : il faut le régler en local, sur votre branche, puis pousser de nouveau.';
     case 'merge-conflict':
-      return `Conflit : les deux branches ont modifié ${list(info.paths)} différemment. Corrigez (par exemple echo "…" > ${info.paths[0]}), puis git add et git commit, ou annulez avec git merge --abort.`;
+      return `Conflit : les deux branches ont modifié ${list(info.paths)} différemment. Corrigez (par exemple echo "…" > ${info.paths[0]}, ou git checkout --ours|--theirs ${info.paths[0]} pour garder un seul côté), puis git add et git commit, ou annulez avec git merge --abort.`;
     case 'merge-abort':
       return "Fusion annulée : la staging area et le répertoire de travail sont revenus à leur état d'avant git merge.";
+    case 'reset': {
+      if (info.id === info.from && !info.mode.includes('hard'))
+        return 'HEAD est resté sur le même commit : git reset a seulement réaligné la staging area sur lui.';
+      const where = `${info.branch ?? 'HEAD'} pointe maintenant sur ${info.id}`;
+      if (info.mode === 'soft')
+        return `${where} (git reset --soft) : les commits suivants sont défaits, mais leurs modifications restent dans la staging area, prêtes à être recommitées.`;
+      if (info.mode === 'hard')
+        return `${where} (git reset --hard) : la staging area et les fichiers suivis ont été remis dans l'état de ce commit, les modifications non commitées sont perdues. Les commits écartés n'existent plus que comme orphelins (en transparence dans le graphe) : git reset --hard ${info.from} les rétablit.`;
+      return `${where} (git reset --mixed) : la staging area est remise à zéro, mais vos fichiers gardent leurs modifications : il suffit de refaire git add puis git commit.`;
+    }
+    case 'reset-paths':
+      return `${list(info.paths)} sort de la staging area (git reset <fichier> est l'inverse de git add) : le fichier garde ses modifications mais ne fera plus partie du prochain commit.`;
+    case 'pick':
+      if (info.noCommit)
+        return `Les modifications sont appliquées à la staging area et au répertoire de travail, sans commit : à vous de faire git commit (ou git restore pour les abandonner).`;
+      if (info.pickKind === 'revert')
+        return `git revert n'efface rien de l'historique : il ajoute un nouveau commit ${list(info.created)} qui annule les modifications de l'ancien. C'est la façon sûre de défaire un commit déjà partagé.`;
+      return `git cherry-pick a copié ${plural(info.created.length, 'commit')} sur la branche courante : mêmes modifications mais ${info.created.length > 1 ? 'nouveaux hash' : 'nouveau hash'} (${list(info.created)}). Les commits d'origine n'ont pas bougé.`;
+    case 'pick-conflict':
+      return `Conflit sur ${list(info.paths)} : le ${info.pickKind} s'est arrêté. Corrigez le fichier, git add, puis git ${info.pickKind} --continue ; ou git ${info.pickKind} --skip pour ignorer ce commit, git ${info.pickKind} --abort pour tout annuler.`;
+    case 'pick-empty':
+      return `Ce ${info.pickKind} ne change rien : les modifications du commit sont déjà présentes dans la branche courante, donc aucun commit n'est créé.`;
+    case 'pick-continue':
+      return `Le ${info.pickKind} est terminé.`;
+    case 'pick-skip':
+      return `Le commit en conflit est ignoré : le ${info.pickKind} continue avec la suite.`;
+    case 'pick-abort':
+      return `${info.pickKind === 'revert' ? 'Revert' : 'Cherry-pick'} annulé : la branche, la staging area et les fichiers sont revenus à leur état d'avant.`;
+    case 'rebase':
+      if (info.ff)
+        return `Avance rapide : votre branche n'avait aucun commit propre, elle a simplement avancé jusqu'à ${info.upstream}, sans rien rejouer.`;
+      if (!info.count)
+        return `Aucun commit n'a été rejoué${info.dropped ? ` (${plural(info.dropped, 'commit')} ignoré${info.dropped > 1 ? 's' : ''} : déjà présent${info.dropped > 1 ? 's' : ''} côté ${info.upstream})` : ''} : ${info.branch ?? 'HEAD'} pointe maintenant sur le même commit que ${info.upstream}.`;
+      return `git rebase a rejoué ${plural(info.count, 'commit')}${info.branch ? ` de ${info.branch}` : ''} par-dessus ${info.upstream} : même contenu, mais de NOUVEAUX commits (les anciens, en transparence dans le graphe, sont orphelins). L'historique est linéaire, sans commit de fusion.${info.dropped ? ` ${plural(info.dropped, 'commit')} ignoré${info.dropped > 1 ? 's' : ''} : déjà présent${info.dropped > 1 ? 's' : ''} côté ${info.upstream}.` : ''} Si ces commits avaient déjà été poussés, le prochain push demandera --force-with-lease : ne réécrivez jamais un historique partagé.`;
+    case 'rebase-uptodate':
+      return `Rien à rejouer : la branche contient déjà tout ${info.upstream}.`;
+    case 'rebase-conflict':
+      return `Le rebase s'est arrêté sur le commit ${info.id}, en conflit sur ${list(info.paths)}. Corrigez, git add, puis git rebase --continue ; ou git rebase --skip pour ignorer ce commit, git rebase --abort pour tout annuler. Pendant un rebase, « ours » est la branche sur laquelle on rejoue, « theirs » le commit rejoué.`;
+    case 'rebase-abort':
+      return `Rebase annulé : ${info.branch ?? 'HEAD'}, la staging area et les fichiers sont revenus à leur état d'avant.`;
+    case 'rebase-dirty':
+      return 'Un rebase refuse de partir avec des modifications non commitées : commitez-les, ou mettez-les de côté avec git stash puis reprenez-les avec git stash pop.';
+    case 'rebase-no-upstream':
+      return 'Précisez la branche de référence : git rebase main (ou git rebase origin/main).';
+    case 'tag-list':
+      return info.count
+        ? 'git tag liste les tags : des noms posés sur des commits précis, qui ne bougent pas (contrairement aux branches).'
+        : "Aucun tag pour le moment : git tag v1.0 en pose un sur le commit courant.";
+    case 'tag-create':
+      if (info.updated) return `Le tag ${info.name} pointe maintenant sur ${info.id} (il a été déplacé de force).`;
+      return `Tag ${info.annotated ? 'annoté' : 'léger'} ${info.name} posé sur ${info.id}. ${info.annotated ? 'Il garde un message, un auteur et une date. ' : ''}Il reste local tant que vous ne le poussez pas : git push origin ${info.name}.`;
+    case 'tag-delete':
+      return `Tag ${list(info.names)} supprimé en local. Sur le dépôt distant il existe encore : git push origin --delete ${info.names[0]} pour l'y supprimer aussi.`;
+    case 'stash-push':
+      return `Vos modifications sont rangées dans la pile (stash@{0}) et le répertoire de travail est revenu à l'état du dernier commit${info.untracked ? ' (fichiers non suivis compris)' : ''}. git stash pop les remet.`;
+    case 'stash-none':
+      return 'Rien à mettre de côté : git stash ne range que les modifications des fichiers suivis (ajoutez -u pour les fichiers non suivis).';
+    case 'stash-list':
+      return info.count
+        ? 'La pile du stash : stash@{0} est la plus récente. git stash pop reprend celle du dessus.'
+        : 'La pile est vide : rien n\'a été mis de côté.';
+    case 'stash-apply':
+      if (info.conflicts.length)
+        return `Le stash a été appliqué mais ${list(info.conflicts)} est en conflit avec des changements récents : les marqueurs sont dans le fichier. Corrigez-le puis git add ; le stash est conservé tant que vous ne faites pas git stash drop.`;
+      return info.pop
+        ? 'git stash pop a remis les modifications dans le répertoire de travail et retiré cette entrée de la pile.'
+        : 'git stash apply a remis les modifications dans le répertoire de travail ; l\'entrée reste dans la pile (git stash drop pour la supprimer).';
+    case 'stash-drop':
+      return `L'entrée stash@{${info.n}} est supprimée de la pile : ses modifications ne seront pas remises.`;
+    case 'stash-clear':
+      return info.count ? 'La pile du stash est vidée.' : 'La pile était déjà vide.';
+    case 'stash-show':
+      return 'git stash show résume ce que contient une entrée du stash (-p pour le détail).';
+    case 'stash-branch':
+      return `Branche ${info.name} créée sur le commit où le stash avait été fait, stash appliqué puis supprimé de la pile : le moyen sûr de reprendre un travail mis de côté qui ne s'applique plus proprement.`;
+    case 'git-rm':
+      return info.cached
+        ? `${list(info.paths)} n'est plus suivi par Git, mais reste dans votre dossier (la suppression sera enregistrée au prochain commit). Pensez à l'ajouter à .gitignore.`
+        : `${list(info.paths)} est supprimé du dossier et de la staging area : la suppression sera enregistrée au prochain commit.`;
+    case 'git-rm-refused':
+      return 'Git protège votre travail : il refuse de supprimer un fichier modifié. --cached ne le retire que du suivi, -f force.';
+    case 'check-ignore':
+      return info.count
+        ? 'Ces fichiers sont ignorés : git status ne les montre pas et git add . les saute.'
+        : "Aucun de ces fichiers n'est ignoré par .gitignore.";
     case 'diff':
+      if (info.revs === 2)
+        return info.empty
+          ? 'Les deux commits ont exactement le même contenu : aucune différence.'
+          : 'git diff <a> <b> compare directement le contenu de deux commits (ou branches) : - = version de a, + = version de b.';
+      if (info.revs === 1)
+        return info.empty
+          ? 'Le répertoire de travail est identique à ce commit.'
+          : 'git diff <commit> compare ce commit au répertoire de travail (staging area comprise) : - = ce que le commit contenait, + = ce que vous avez maintenant.';
       if (info.staged) {
         return info.empty
           ? "La staging area est identique au dernier commit : rien n'est prêt à être commité."
@@ -1112,8 +1670,14 @@ export function promptInfo(state) {
   const repo = state.repo;
   if (!repo) return { label: null, branch: null };
   const detached = repo.head.type === 'detached';
-  return {
-    label: `${detached ? `(${repo.head.commit}...)` : repo.head.name}${repo.merge ? '|MERGING' : ''}`,
-    branch: detached ? null : repo.head.name,
-  };
+  let name = detached ? `(${repo.head.commit}...)` : repo.head.name;
+  let branch = detached ? null : repo.head.name;
+  let phase = '';
+  if (repo.merge) phase = '|MERGING';
+  else if (repo.rebase) {
+    ({ branch } = repo.rebase);
+    name = branch ?? name;
+    phase = `|REBASE ${repo.rebase.step}/${repo.rebase.total}`;
+  } else if (repo.pick) phase = repo.pick.kind === 'revert' ? '|REVERTING' : '|CHERRY-PICKING';
+  return { label: `${name}${phase}`, branch };
 }
