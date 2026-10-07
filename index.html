@@ -1,0 +1,152 @@
+<!doctype html>
+<html lang="fr">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+  <meta name="color-scheme" content="dark">
+  <meta name="description" content="Simulateur Git pédagogique : tapez de vraies commandes et regardez le graphe de commits se construire.">
+  <title>Simulateur Git</title>
+  <link rel="stylesheet" href="style.css">
+</head>
+<body>
+  <header class="topbar">
+    <div class="brand">
+      <svg class="brand-logo" viewBox="0 0 24 24" aria-hidden="true">
+        <circle cx="6" cy="5" r="2.5"/><circle cx="6" cy="19" r="2.5"/><circle cx="18" cy="9" r="2.5"/>
+        <path d="M6 7.5v9M18 11.5c0 4-6 3-11 6"/>
+      </svg>
+      <h1>Simulateur Git</h1>
+    </div>
+    <nav class="actions" aria-label="Actions">
+      <button type="button" class="btn" data-action="undo" disabled>
+        <span aria-hidden="true">↶</span>
+        <span class="label-long">Annuler la dernière commande</span><span class="label-short">Annuler</span>
+      </button>
+      <button type="button" class="btn" data-action="reset">Réinitialiser</button>
+      <button type="button" class="btn" data-action="help">Aide</button>
+      <button type="button" class="btn btn-toggle" data-action="panel" aria-expanded="false" aria-controls="panel">Zones Git</button>
+    </nav>
+  </header>
+
+  <div class="layout">
+    <main class="workspace">
+      <section class="graph" data-graph aria-label="Graphe des commits">
+        <div class="graph-scroll" data-graph-scroll></div>
+        <div class="graph-empty" data-graph-empty hidden></div>
+        <div class="graph-tooltip" data-graph-tooltip role="tooltip" hidden></div>
+      </section>
+
+      <section class="terminal" data-terminal aria-label="Terminal">
+        <div class="term-output" data-term-output role="log" aria-live="polite"></div>
+        <form class="term-input-row" data-term-form autocomplete="off">
+          <label class="term-prompt" data-term-prompt for="term-input"></label>
+          <input id="term-input" class="term-input" data-term-input type="text" autocomplete="off" autocorrect="off"
+                 autocapitalize="off" spellcheck="false" enterkeyhint="send" aria-label="Commande">
+          <button type="button" class="term-tab" data-term-tab aria-label="Compléter la commande (Tab)">⇥</button>
+        </form>
+      </section>
+    </main>
+
+    <aside class="panel" id="panel" data-panel aria-label="Les trois zones de Git" hidden>
+      <div class="panel-head">
+        <h2>Les trois zones de Git</h2>
+        <button type="button" class="btn btn-icon" data-action="close-panel" aria-label="Fermer le panneau">✕</button>
+      </div>
+      <section class="zone zone-workdir">
+        <h3><span class="zone-num">1</span> Répertoire de travail</h3>
+        <p class="zone-hint">Vos fichiers, tels qu'ils sont sur le disque.</p>
+        <div data-zone="workdir"></div>
+      </section>
+      <p class="zone-arrow"><code>git add</code> ↓</p>
+      <section class="zone zone-index">
+        <h3><span class="zone-num">2</span> Staging area <small>(index)</small></h3>
+        <p class="zone-hint">Ce qui partira dans le prochain commit.</p>
+        <div data-zone="index"></div>
+      </section>
+      <p class="zone-arrow"><code>git commit</code> ↓</p>
+      <section class="zone zone-repo">
+        <h3><span class="zone-num">3</span> Dépôt local <small>(.git)</small></h3>
+        <p class="zone-hint">L'historique enregistré : commits et branches.</p>
+        <div data-zone="repo"></div>
+      </section>
+    </aside>
+  </div>
+
+  <dialog class="help" data-help aria-labelledby="help-title">
+    <div class="help-head">
+      <h2 id="help-title">Aide</h2>
+      <button type="button" class="btn btn-icon" data-action="close-help" aria-label="Fermer l'aide">✕</button>
+    </div>
+    <div class="help-body">
+      <section>
+        <h3>Principe</h3>
+        <p>Tapez de vraies commandes dans le terminal (en bas). Le graphe (en haut) se redessine après chaque commande :
+          chaque cercle est un commit, chaque ligne horizontale une branche, avec sa propre couleur.
+          Une phrase en italique explique ce qui vient de se passer.</p>
+      </section>
+      <section>
+        <h3>Commandes de fichiers</h3>
+        <ul class="help-list">
+          <li><code>touch notes.txt</code> crée un fichier vide</li>
+          <li><code>echo "Bonjour" &gt; notes.txt</code> remplace le contenu du fichier</li>
+          <li><code>echo "Suite" &gt;&gt; notes.txt</code> ajoute une ligne à la fin</li>
+          <li><code>cat notes.txt</code>, <code>ls</code>, <code>rm notes.txt</code>, <code>clear</code></li>
+        </ul>
+      </section>
+      <section>
+        <h3>Commandes Git disponibles</h3>
+        <ul class="help-list">
+          <li><code>git init</code>, <code>git status</code>, <code>git add &lt;fichier&gt;</code> ou <code>git add .</code></li>
+          <li><code>git commit -m "message"</code>, <code>git commit -am "message"</code></li>
+          <li><code>git log</code> (<code>--oneline</code>, <code>--graph</code>, <code>--all</code>), <code>git diff</code> (<code>--staged</code>)</li>
+          <li><code>git branch</code>, <code>git branch nom</code>, <code>git branch -d nom</code></li>
+          <li><code>git checkout nom</code>, <code>git checkout -b nom</code>, <code>git switch nom</code>, <code>git switch -c nom</code></li>
+          <li><code>git merge nom</code> (avance rapide, commit de fusion, conflits, <code>--abort</code>)</li>
+          <li><code>git help</code> et <code>git help &lt;commande&gt;</code> ; <code>help</code> pour l'aide en français</li>
+        </ul>
+        <p class="help-note">reset, revert, cherry-pick, stash, tag, rebase et remote sont prévus dans une prochaine version.</p>
+      </section>
+      <section>
+        <h3>Lire le graphe</h3>
+        <ul class="help-list">
+          <li>Le temps va de gauche à droite ; un commit de fusion a un point central et deux traits entrants.</li>
+          <li>Les étiquettes colorées sont les branches ; l'étiquette blanche <strong>HEAD</strong> indique où vous êtes.</li>
+          <li>Survolez un commit pour voir son hash, son message et son auteur ; cliquez dessus pour insérer son hash dans le terminal.</li>
+          <li>Le bouton « Zones Git » ouvre le panneau des trois zones : répertoire de travail, staging area et dépôt local.</li>
+        </ul>
+      </section>
+      <section>
+        <h3>Raccourcis</h3>
+        <ul class="help-list">
+          <li><kbd>↑</kbd> <kbd>↓</kbd> historique des commandes · <kbd>Tab</kbd> autocomplétion (commandes, branches, fichiers)</li>
+          <li><kbd>Ctrl</kbd>+<kbd>L</kbd> efface l'écran · <code>cmd1 &amp;&amp; cmd2</code> enchaîne deux commandes</li>
+          <li>Tout est sauvegardé automatiquement dans ce navigateur. « Annuler » revient à l'état d'avant la dernière commande.</li>
+        </ul>
+      </section>
+      <section>
+        <h3>Pour démarrer</h3>
+        <pre class="help-pre">git init
+echo "Mon projet" &gt; README.md
+git add README.md
+git commit -m "Premier commit"
+git switch -c feature</pre>
+      </section>
+    </div>
+  </dialog>
+
+  <div class="boot-error" data-boot-error hidden>
+    <h2>Le simulateur n'a pas pu démarrer</h2>
+    <p>Si vous avez ouvert <code>index.html</code> directement depuis le disque (adresse en <code>file://</code>),
+      votre navigateur bloque sans doute les modules JavaScript (c'est le cas de Chrome et Edge).</p>
+    <p>Solution : dans le dossier du projet, lancez <code>python3 -m http.server 8000</code>
+      puis ouvrez <code>http://localhost:8000</code> (ou utilisez l'extension « Live Server » de VS Code).</p>
+  </div>
+
+  <script type="module" src="js/main.js"></script>
+  <script>
+    addEventListener('load', () => {
+      if (!document.documentElement.hasAttribute('data-ready')) document.querySelector('[data-boot-error]').hidden = false;
+    });
+  </script>
+</body>
+</html>
