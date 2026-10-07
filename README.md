@@ -1,21 +1,37 @@
 # Simulateur Git pédagogique
 
-Un terminal pour s'entraîner à Git avec de vraies commandes, et au-dessus un graphe de commits
-qui se construit en direct, avec une couleur par branche.
-HTML, CSS et JavaScript pur : aucun framework, aucune dépendance, aucune étape de compilation.
+Un terminal pour s'entraîner à Git avec de vraies commandes. Au-dessus, un graphe de commits se
+dessine en direct, avec une couleur par branche.
+Le projet est écrit en HTML, CSS et JavaScript pur : pas de framework, pas de dépendance, rien à
+installer ni à compiler.
 
-## Lancer le simulateur
+## Essayer en ligne
 
-Le code est découpé en modules ES (`<script type="module">`). Chrome et Edge refusent de charger
-des modules depuis une page ouverte par double-clic (adresse `file://`). Dans ce cas, la page
-affiche un message qui explique quoi faire. Il suffit de servir le dossier :
+**https://esteban-crln.github.io/git-train/**
 
-```bash
-python3 -m http.server 8000   # puis ouvrir http://localhost:8000
-```
+Rien à télécharger : ouvrez le lien et tapez vos commandes dans le terminal. Tout se passe dans
+votre navigateur, le simulateur ne touche pas à vos vrais fichiers.
 
-N'importe quel serveur statique convient (extension « Live Server » de VS Code, `npx serve`,
-GitHub Pages…).
+## Lancer le simulateur sur son ordinateur
+
+1. Récupérez le projet : `git clone https://github.com/esteban-crln/git-train.git`, puis entrez
+   dans le dossier créé (`cd git-train`).
+2. Démarrez un petit serveur web dans ce dossier :
+
+   ```bash
+   python -m http.server 8000
+   ```
+
+   (Sur Mac ou Linux, la commande peut être `python3` à la place de `python`.)
+3. Ouvrez http://localhost:8000 dans votre navigateur.
+
+Pourquoi un serveur, et pas un double-clic sur `index.html` ? Le code est découpé en plusieurs
+fichiers JavaScript (des « modules ») que Chrome et Edge refusent de charger quand la page est
+ouverte directement depuis le disque. Dans ce cas, la page affiche un message qui rappelle la
+marche à suivre.
+
+Python n'est qu'un exemple : n'importe quel serveur de fichiers convient, comme l'extension
+« Live Server » de VS Code ou la commande `npx serve`.
 
 ## Arborescence
 
@@ -202,8 +218,12 @@ de la collègue, et les deux anciens, encore pointés par `origin/ma-feature`, r
 `git status` annonce `have diverged` ; le premier `git push` est refusé (`non-fast-forward`) et
 l'explication propose `--force-with-lease`, qui passe.
 
-Pour provoquer un conflit : faites modifier `a.txt` par la collègue (`collab main a.txt`) puis
-modifiez-le aussi chez vous avant le rebase. Il s'arrête sur le commit fautif (`git status` affiche
-`interactive rebase in progress`) : corrigez le fichier (`echo "…" > a.txt`, ou
-`git checkout --theirs a.txt`), `git add a.txt`, puis `git rebase --continue`. `git rebase --abort`
-remet tout comme avant.
+Pour provoquer un conflit, remplacez `collab main` par `collab main a.txt` : la collègue crée alors
+elle aussi un fichier `a.txt` sur `main`, avec un autre contenu que le vôtre. Le rebase s'arrête sur
+votre commit « ajoute a » (`git status` affiche `interactive rebase in progress`). Pour continuer :
+
+1. corrigez le fichier, avec `echo "…" > a.txt` ou `git checkout --theirs a.txt` ;
+2. `git add a.txt` ;
+3. `git rebase --continue`.
+
+`git rebase --abort` annule tout et remet la branche comme avant le rebase.
