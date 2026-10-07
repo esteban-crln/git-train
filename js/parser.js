@@ -3,6 +3,7 @@
  * Ne touche jamais au DOM : renvoie des lignes que le terminal se charge d'afficher.
  */
 import * as git from './engine.js';
+import * as remote from './remote.js';
 
 const GIT_VERSION = '2.47.0';
 const UNSUPPORTED = 'Commande non supportée dans ce simulateur.';
@@ -140,6 +141,7 @@ function expandGlobs(words, workdir) {
 
 const flag = (key) => ({ key });
 const valued = (key, multi = false) => ({ key, value: true, multi });
+const counter = (key) => ({ key, count: true });
 
 function parseOptions(args, { options = {}, numeric = null }) {
   const opts = {};
@@ -148,6 +150,7 @@ function parseOptions(args, { options = {}, numeric = null }) {
   let dashDash = false;
   const set = (def, v) => {
     if (def.multi) (opts[def.key] ??= []).push(v);
+    else if (def.count) opts[def.key] = (opts[def.key] ?? 0) + 1;
     else opts[def.key] = v;
   };
   for (let i = 0; i < args.length; i++) {
@@ -194,12 +197,31 @@ function parseOptions(args, { options = {}, numeric = null }) {
 
 const hasFile = (state, name) => Object.prototype.hasOwnProperty.call(state.workdir, name);
 const branchNames = (state) => (state.repo ? Object.keys(state.repo.branches).sort() : []);
+const remoteNames = (state) => (state.repo ? Object.keys(state.repo.remotes).sort() : []);
+const remoteRefNames = (state) => (state.repo ? Object.keys(state.repo.remoteRefs).sort() : []);
+// `git checkout feature` crée la branche locale qui suit origin/feature : on propose donc ces noms courts.
+const remoteShortNames = (state) => remoteRefNames(state).map((ref) => ref.slice(ref.indexOf('/') + 1));
 const trackedFiles = (state) => (state.repo ? Object.keys(state.repo.index).sort() : []);
 const changedFiles = (state) => {
   if (!state.repo) return [];
   const st = git.computeStatus(state);
   return [...new Set([...st.untracked, ...st.unstaged.map((e) => e.path), ...st.unmerged.map((e) => e.path)])].sort();
 };
+
+/** `git push main` : Git y voit un dépôt distant nommé main ; on rappelle la forme complète. */
+function withRemoteHint(state, first, res, verb) {
+  const repo = state.repo;
+  if (res.ok || !repo || first === undefined || Object.prototype.hasOwnProperty.call(repo.remotes, first)) return res;
+  if (!Object.prototype.hasOwnProperty.call(repo.branches, first)) return res;
+  const origin = Object.keys(repo.remotes).sort()[0] ?? 'origin';
+  return {
+    ...res,
+    out: [
+      ...res.out,
+      [[`« ${first} » est une branche, pas un dépôt distant : écrivez git ${verb} ${origin} ${first}`, 'dim']],
+    ],
+  };
+}
 
 /**
  * Registre des sous-commandes supportées. Ajouter une commande prévue (reset, stash…) consiste à
@@ -302,33 +324,44 @@ const GIT = {
   },
   branch: {
     summary: 'List, create, or delete branches',
-    usage: 'git branch [-v] | git branch <name> [<start-point>] | git branch (-d | -D) <name>...',
+    usage:
+      'git branch [-v] [-r | -a] | git branch <name> [<start-point>] | git branch (-d | -D) <name>... | git branch -u <upstream>',
     help: [
-      'Sans argument : liste les branches (* = branche courante).',
+      'Sans argument : liste les branches (* = branche courante). -r : branches de suivi distantes, -a : toutes.',
       "git branch <nom> crée une branche (une simple étiquette sur le commit courant) sans s'y placer.",
       'git branch -d <nom> supprime une branche déjà fusionnée (-D pour forcer).',
+      'git branch -vv montre la branche distante suivie ; git branch -u origin/main fait suivre origin/main à la branche courante.',
     ],
-    examples: ['git branch feature', 'git branch -d feature'],
+    examples: ['git branch feature', 'git branch -d feature', 'git branch -vv'],
     options: {
       d: flag('delete'),
       delete: flag('delete'),
       D: { key: 'forceDelete' },
-      v: flag('verbose'),
-      verbose: flag('verbose'),
+      v: counter('verbose'),
+      verbose: counter('verbose'),
       l: flag('list'),
       list: flag('list'),
-      a: flag('list'),
-      all: flag('list'),
+      r: flag('remotes'),
+      remotes: flag('remotes'),
+      a: flag('all'),
+      all: flag('all'),
+      u: valued('setUpstream'),
+      'set-upstream-to': valued('setUpstream'),
+      'unset-upstream': flag('unsetUpstream'),
     },
-    complete: branchNames,
+    complete: (state) => [...branchNames(state), ...remoteRefNames(state)],
     run: (state, { opts, positional }) => {
+      if (opts.unsetUpstream) return git.branchSetUpstream(state, { branch: positional[0] ?? null, unset: true });
+      if (opts.setUpstream !== undefined) {
+        return git.branchSetUpstream(state, { upstream: opts.setUpstream, branch: positional[0] ?? null });
+      }
       if (opts.delete || opts.forceDelete)
         return git.branchDelete(state, { names: positional, force: !!opts.forceDelete });
-      if (positional.length && !opts.list) {
+      if (positional.length && !opts.list && !opts.remotes && !opts.all) {
         if (positional.length > 2) return fail(state, 'fatal: too many arguments for a create operation');
         return git.branchCreate(state, { name: positional[0], start: positional[1] ?? null });
       }
-      return git.branchList(state, { verbose: !!opts.verbose });
+      return git.branchList(state, { verbose: opts.verbose ?? 0, remotes: !!opts.remotes, all: !!opts.all });
     },
   },
   checkout: {
@@ -341,7 +374,7 @@ const GIT = {
     ],
     examples: ['git checkout feature', 'git checkout -b feature'],
     options: { b: valued('newBranch'), detach: flag('detach') },
-    complete: (state) => [...branchNames(state), ...trackedFiles(state)],
+    complete: (state) => [...branchNames(state), ...remoteShortNames(state), ...trackedFiles(state)],
     run: (state, { opts, positional, paths, dashDash }) => {
       const newBranch = opts.newBranch ?? null;
       if (dashDash)
@@ -365,7 +398,7 @@ const GIT = {
     ],
     examples: ['git switch main', 'git switch -c feature'],
     options: { c: valued('create'), create: valued('create'), d: flag('detach'), detach: flag('detach') },
-    complete: branchNames,
+    complete: (state) => [...branchNames(state), ...remoteShortNames(state)],
     run: (state, { opts, positional }) => {
       if (positional.length > 1) return fail(state, 'fatal: only one reference expected');
       return git.switchBranch(state, {
@@ -394,7 +427,7 @@ const GIT = {
       continue: flag('continue'),
       'no-edit': flag('noEdit'),
     },
-    complete: (state) => branchNames(state).filter((b) => b !== state.repo?.head.name),
+    complete: (state) => [...branchNames(state).filter((b) => b !== state.repo?.head.name), ...remoteRefNames(state)],
     run: (state, { opts, positional }, env) => {
       if (opts.continue) {
         return state.repo?.merge
@@ -434,6 +467,178 @@ const GIT = {
       return git.diff(state, { staged: !!opts.staged, paths: files });
     },
   },
+  config: {
+    summary: 'Get and set repository or global options',
+    usage: 'git config [--global] <name> [<value>] | git config --list',
+    help: [
+      "Lit ou modifie un réglage. Les plus utiles : user.name et user.email (l'auteur de vos commits).",
+      'Aussi simulés : pull.rebase false (git pull fusionne) et pull.ff only (git pull refuse de fusionner).',
+    ],
+    examples: [
+      'git config --global user.name "Prénom Nom"',
+      'git config --global user.email "adresse@mail.fr"',
+      'git config --list',
+    ],
+    options: { global: flag('global'), local: flag('local'), list: flag('list'), l: flag('list') },
+    complete: () => Object.keys(git.CONFIG_KEYS),
+    run: (state, { opts, positional }) => {
+      if (opts.list) return git.config(state, { list: true });
+      if (!positional.length || positional.length > 2) {
+        return fail(state, [
+          'error: wrong number of arguments, should be from 1 to 2',
+          'usage: git config [<options>]',
+        ]);
+      }
+      const key = positional[0].toLowerCase();
+      if (!Object.prototype.hasOwnProperty.call(git.CONFIG_KEYS, key)) {
+        return unsupported(state, `Seuls ${Object.keys(git.CONFIG_KEYS).join(', ')} sont simulés.`);
+      }
+      return git.config(state, { key, value: positional[1] ?? null, global: !!opts.global });
+    },
+  },
+  clone: {
+    summary: 'Clone a repository into a new directory',
+    usage: 'git clone <url> [.]',
+    help: [
+      'Copie un dépôt distant (tout son historique) dans le dossier courant, qui doit être vide, et le relie à lui sous le nom origin.',
+      `Le simulateur héberge un dépôt de démonstration : git clone ${git.DEMO_URL}`,
+    ],
+    examples: [`git clone ${git.DEMO_URL}`],
+    complete: () => [git.DEMO_URL],
+    run: (state, { positional }) => {
+      if (positional.length > 2 || (positional[1] !== undefined && positional[1] !== '.')) {
+        return unsupported(
+          state,
+          'Ce simulateur clone toujours dans le dossier courant : git clone <url> (ou git clone <url> .).',
+        );
+      }
+      return remote.cloneRepo(state, { url: positional[0] ?? null });
+    },
+  },
+  remote: {
+    summary: 'Manage set of tracked repositories',
+    usage: 'git remote [-v] | git remote add <name> <url> | git remote remove <name>',
+    help: [
+      'Gère les dépôts distants : des adresses (URL) que Git retient sous un nom court. origin est le nom habituel du dépôt GitHub.',
+      "git remote -v : liste les adresses ; git remote add origin <url> : en ajoute une ; git remote remove origin : l'oublie.",
+    ],
+    examples: [`git remote add origin ${git.DEMO_URL}`, 'git remote -v'],
+    options: { v: flag('verbose'), verbose: flag('verbose') },
+    complete: (state, args) => {
+      const sub = args.filter((a) => !a.startsWith('-'));
+      if (!sub.length) return ['add', 'remove', 'rm'];
+      return ['remove', 'rm'].includes(sub[0]) && sub.length === 1 ? remoteNames(state) : [];
+    },
+    run: (state, { opts, positional }) => {
+      const [action, ...args] = positional;
+      if (action === undefined) return remote.remoteList(state, { verbose: !!opts.verbose });
+      if (action === 'add') {
+        if (args.length !== 2) {
+          return fail(state, [
+            'usage: git remote add [-t <branch>] [-m <master>] [-f] [--tags | --no-tags] [--mirror=<fetch|push>] <name> <url>',
+            ...(args.length === 1
+              ? [[[`Il manque le nom du dépôt distant : git remote add origin ${args[0]}`, 'dim']]]
+              : []),
+          ]);
+        }
+        return remote.remoteAdd(state, { name: args[0], url: args[1] });
+      }
+      if (action === 'remove' || action === 'rm') {
+        if (args.length !== 1) return fail(state, 'usage: git remote remove <name>');
+        return remote.remoteRemove(state, { name: args[0] });
+      }
+      if (['rename', 'set-url', 'show', 'get-url', 'prune', 'update', 'set-head', 'set-branches'].includes(action)) {
+        return unsupported(state, `git remote ${action} n'est pas simulée (seules add, remove et -v le sont).`);
+      }
+      return fail(state, [`error: unknown subcommand: \`${action}'`, 'usage: git remote [-v | --verbose]']);
+    },
+  },
+  fetch: {
+    summary: 'Download objects and refs from another repository',
+    usage: 'git fetch [--all] [--prune] [<remote>]',
+    help: [
+      'Télécharge les nouveaux commits du dépôt distant et met à jour les branches de suivi (origin/main…), sans toucher à vos branches ni à vos fichiers.',
+      "On peut ensuite comparer (git log main..origin/main) puis fusionner (git merge origin/main). git pull fait les deux d'un coup.",
+    ],
+    examples: ['git fetch', 'git fetch origin'],
+    options: { all: flag('all'), prune: flag('prune'), p: flag('prune') },
+    complete: remoteNames,
+    run: (state, { opts, positional }) => {
+      if (positional.length > 1)
+        return unsupported(state, "git fetch <remote> <branche> n'est pas simulée : utilisez git fetch <remote>.");
+      return remote.fetch(state, { remote: positional[0] ?? null, all: !!opts.all, prune: !!opts.prune });
+    },
+  },
+  pull: {
+    summary: 'Fetch from and integrate with another repository or a local branch',
+    usage: 'git pull [--ff-only] [--no-rebase] [<remote> [<branch>]]',
+    help: [
+      'Récupère les commits du dépôt distant (git fetch) puis les fusionne dans la branche courante (git merge).',
+      'Si votre branche et la branche distante ont chacune des commits nouveaux, Git demande comment réconcilier : ajoutez --no-rebase pour fusionner.',
+    ],
+    examples: ['git pull', 'git pull --no-rebase'],
+    options: {
+      'ff-only': flag('ffOnly'),
+      'no-rebase': flag('noRebase'),
+      rebase: flag('rebase'),
+      r: flag('rebase'),
+      ff: flag('ff'),
+      'no-ff': flag('noFF'),
+    },
+    complete: (state, args) =>
+      args.filter((a) => !a.startsWith('-')).length
+        ? [...branchNames(state), ...remoteShortNames(state)]
+        : remoteNames(state),
+    run: (state, { opts, positional }, env) => {
+      if (opts.rebase)
+        return unsupported(state, 'git pull --rebase repose sur git rebase, prévu dans une prochaine version.');
+      if (positional.length > 2) return unsupported(state, "Le pull de plusieurs branches n'est pas simulé.");
+      const res = remote.pull(
+        state,
+        {
+          remote: positional[0] ?? null,
+          branch: positional[1] ?? null,
+          ffOnly: !!opts.ffOnly,
+          noRebase: !!opts.noRebase,
+          noFF: !!opts.noFF,
+        },
+        env,
+      );
+      return withRemoteHint(state, positional[0], res, 'pull');
+    },
+  },
+  push: {
+    summary: 'Update remote refs along with associated objects',
+    usage: 'git push [-u] [-f] [<remote> [<branch>]] | git push <remote> --delete <branch>',
+    help: [
+      "Envoie vos commits vers le dépôt distant. Le push est refusé si le dépôt distant contient des commits que vous n'avez pas : faites d'abord git pull.",
+      '-u (--set-upstream) mémorise la branche distante à suivre : ensuite, git push et git pull suffisent. --delete supprime une branche distante.',
+    ],
+    examples: ['git push -u origin main', 'git push', 'git push origin --delete feature'],
+    options: {
+      u: flag('setUpstream'),
+      'set-upstream': flag('setUpstream'),
+      f: flag('force'),
+      force: flag('force'),
+      d: flag('delete'),
+      delete: flag('delete'),
+    },
+    complete: (state, args) =>
+      args.filter((a) => !a.startsWith('-')).length ? branchNames(state) : remoteNames(state),
+    run: (state, { opts, positional }) =>
+      withRemoteHint(
+        state,
+        positional[0],
+        remote.push(state, {
+          remote: positional[0] ?? null,
+          refspecs: positional.slice(1),
+          setUpstream: !!opts.setUpstream,
+          force: !!opts.force,
+          del: !!opts.delete,
+        }),
+        'push',
+      ),
+  },
   help: {
     summary: 'Display help information about Git',
     usage: 'git help [<command>]',
@@ -445,10 +650,11 @@ const GIT = {
 };
 
 const HELP_GROUPS = [
-  ['start a working area (see also: git help tutorial)', ['init']],
+  ['start a working area (see also: git help tutorial)', ['clone', 'init']],
   ['work on the current change (see also: git help everyday)', ['add']],
   ['examine the history and state (see also: git help revisions)', ['diff', 'log', 'status']],
   ['grow, mark and tweak your common history', ['branch', 'checkout', 'commit', 'merge', 'switch']],
+  ['collaborate (see also: git help workflows)', ['fetch', 'pull', 'push']],
 ];
 
 function gitUsageLines() {
@@ -577,7 +783,16 @@ const SHELL_HELP = [
   '  git switch [-c] <branche>   change de branche (version moderne)',
   '  git merge <branche>         fusionne une branche dans la branche courante',
   '  git diff [--staged]         montre les modifications',
+  '  git config --global user.name "Prénom Nom"  (et user.email, --list)',
+  '  git clone <url>             copie un dépôt distant (essayez le dépôt de démonstration)',
+  '  git remote [-v] | add <nom> <url> | remove <nom>',
+  '  git fetch [remote]          télécharge les nouveautés sans fusionner',
+  '  git pull [remote] [branche] fetch + merge ; git push [-u] [remote] [branche]',
   "  git help [commande]         aide d'une commande",
+  '',
+  [['Collègue simulé', 'bold']],
+  '  collab [branche] [fichier]  Camille pousse un commit sur le dépôt distant (pour essayer fetch et pull)',
+  '  mr <source> [cible]         la merge request de <source> est acceptée sur la forge (GitLab/GitHub)',
   '',
   [['Astuces', 'bold']],
   '  ↑/↓ historique · Tab complète · cmd1 && cmd2 enchaîne · clic sur un commit = insère son hash',
@@ -614,6 +829,17 @@ const SHELL = {
     return git.rm(state, names, { recursive: flags.has('r') || flags.has('R'), force: flags.has('f') });
   },
   pwd: (state) => ok(state, [git.REPO_PATH]),
+  mr: (state, args, env) => {
+    const { bad, names } = shellArgs(args, '');
+    if (bad || !names.length || names.length > 2)
+      return unsupported(state, 'Utilisation : mr <branche source> [<branche cible>]');
+    return remote.mergeRequest(state, { source: names[0], target: names[1] ?? null }, env);
+  },
+  collab: (state, args, env) => {
+    const { bad, names } = shellArgs(args, '');
+    if (bad || names.length > 2) return unsupported(state, 'Utilisation : collab [branche] [fichier]');
+    return remote.collab(state, { branch: names[0] ?? null, file: names[1] ?? null }, env);
+  },
   clear: (state) => ({ ...ok(state), clear: true }),
   help: (state) => ok(state, SHELL_HELP),
   cd: (state) => unsupported(state, 'Ce simulateur travaille dans un seul dossier : ~/projet.'),
@@ -687,6 +913,8 @@ function redirect(res, { file, append }) {
 
 /* ------------------------------------------------------------------ explications pédagogiques */
 
+const plural = (n, word) => `${n} ${word}${n > 1 ? 's' : ''}`;
+const newCommits = (n) => (n > 1 ? `${n} nouveaux commits` : `${n} nouveau commit`);
 const list = (items) =>
   items.length <= 1 ? items.join('') : `${items.slice(0, -1).join(', ')} et ${items[items.length - 1]}`;
 
@@ -726,6 +954,8 @@ export function explain(info) {
         ? "git log --graph dessine l'historique : chaque * est un commit, les traits montrent les bifurcations et les fusions."
         : "git log parcourt l'historique depuis HEAD, du commit le plus récent au plus ancien, en remontant les parents.";
     case 'branch-list':
+      if (info.remotes)
+        return 'Les branches en rouge (origin/…) sont les branches de suivi : la dernière image connue du dépôt distant.';
       return info.count
         ? "git branch liste les branches ; l'astérisque marque la branche courante, celle où iront les prochains commits."
         : "Aucune branche n'existe encore : la branche main ne sera vraiment créée qu'au premier commit.";
@@ -740,6 +970,9 @@ export function explain(info) {
         ? `HEAD pointe maintenant sur ${info.branch} : le répertoire de travail reflète son dernier commit (${info.id}).`
         : `HEAD pointe maintenant sur ${info.branch}, qui n'a pas encore de commit.`;
     case 'switch-create':
+      if (info.tracking) {
+        return `Nouvelle branche locale ${info.branch} créée à partir de ${info.tracking}, qu'elle suit : git pull et git push savent où aller.`;
+      }
       return `Nouvelle branche ${info.branch} créée ${info.id ? `sur le commit ${info.id} ` : ''}et HEAD pointe dessus : les prochains commits iront sur ${info.branch}.`;
     case 'already-on':
       return `Vous êtes déjà sur ${info.branch} : rien n'a changé.`;
@@ -757,6 +990,77 @@ export function explain(info) {
       return `Commit de fusion ${info.id} créé : il a deux parents et réunit l'historique de ${info.target} dans ${info.into ?? 'HEAD'}.`;
     case 'merge-uptodate':
       return `Rien à fusionner : ${info.target} fait déjà partie de l'historique de ${info.into ?? 'HEAD'}.`;
+    case 'config-set':
+      return info.key.startsWith('user.')
+        ? `Réglage ${info.key} enregistré : il sera utilisé comme auteur de vos prochains commits.`
+        : `Réglage ${info.key} = ${info.value} enregistré : git pull en tiendra compte.`;
+    case 'config-list':
+      return 'git config --list montre tous les réglages, y compris ceux ajoutés par git remote add (remote.*) et git push -u (branch.*).';
+    case 'clone':
+      return info.empty
+        ? `Le dépôt ${info.url} est vide : vous avez un dépôt local relié à origin, prêt pour un premier commit puis git push -u origin ${info.branch}.`
+        : `git clone a copié les ${plural(info.commits, 'commit')} de ${info.url}, enregistré ce dépôt sous le nom origin et créé ${info.branch}, qui suit origin/${info.branch}.`;
+    case 'remote-list':
+      return info.count
+        ? 'git remote liste les dépôts distants connus ; origin est le nom habituel du dépôt hébergé sur la forge (GitHub, GitLab).'
+        : 'Aucun dépôt distant pour le moment : ajoutez-en un avec git remote add origin <url>.';
+    case 'remote-add':
+      return `Le dépôt distant ${info.name} est enregistré${info.created ? ' (dépôt vide, comme un projet tout juste créé sur GitHub)' : ''} : rien n'est envoyé tant que vous ne faites pas git push.`;
+    case 'remote-remove':
+      return `Le dépôt distant ${info.name} est oublié localement, avec ses branches de suivi ; le dépôt sur la forge, lui, n'est pas touché.`;
+    case 'fetch':
+      if (info.commits) {
+        return `git fetch a téléchargé ${newCommits(info.commits)} de ${info.remote} et mis à jour les branches de suivi (en contour pointillé dans le graphe), sans toucher à vos branches ni à vos fichiers.`;
+      }
+      return info.refs
+        ? 'Les branches de suivi ont été mises à jour ; aucun nouveau commit à télécharger.'
+        : `Rien de nouveau sur ${info.remote} : vos branches de suivi étaient déjà à jour.`;
+    case 'push':
+      if (info.rejected === 'fetch first' || info.rejected === 'non-fast-forward') {
+        return `Push refusé : ${info.remote} contient des commits que vous n'avez pas. Récupérez-les d'abord avec git pull, puis poussez à nouveau.`;
+      }
+      if (info.deleted.length) return `La branche ${list(info.deleted)} a été supprimée sur ${info.remote}.`;
+      if (info.created.length) {
+        return `git push a envoyé vos commits : la branche ${list(info.created)} existe maintenant sur ${info.remote}, et ${info.remote}/${info.created[0]} la représente en local.`;
+      }
+      if (info.updated.length)
+        return `git push a envoyé vos nouveaux commits : ${info.remote}/${info.updated[0]} rejoint votre branche locale.`;
+      return info.upToDate ? `Rien à envoyer : ${info.remote} a déjà tous vos commits.` : null;
+    case 'push-no-upstream':
+      return `Git ne sait pas encore où envoyer ${info.branch} : la première fois, utilisez git push -u origin ${info.branch} (-u mémorise la destination).`;
+    case 'push-no-remote':
+      return "Aucun dépôt distant n'est configuré : ajoutez-en un avec git remote add origin <url>, ou partez d'un git clone.";
+    case 'pull': {
+      const got = info.fetched
+        ? `${newCommits(info.fetched)} téléchargé${info.fetched > 1 ? 's' : ''}`
+        : 'aucun commit à télécharger (déjà présents localement)';
+      switch (info.merge?.kind) {
+        case 'merge-ff':
+          return `git pull = git fetch + git merge : ${got}, puis votre branche a avancé en avance rapide jusqu'à ${info.merge.to}.`;
+        case 'merge-commit':
+          return `git pull = git fetch + git merge : ${got}, puis fusionné${info.fetched > 1 ? 's' : ''} dans votre branche par le commit ${info.merge.id} (deux parents).`;
+        case 'merge-uptodate':
+          return `git pull : ${got} ; votre branche contient déjà tout ${info.remote}/${info.branch}.`;
+        case 'merge-conflict':
+          return explain(info.merge);
+        default:
+          return null;
+      }
+    }
+    case 'pull-divergent':
+      return `Votre branche et ${info.ref} ont chacune des commits que l'autre n'a pas. Pour les fusionner : git pull --no-rebase (ou une fois pour toutes : git config pull.rebase false).`;
+    case 'pull-no-tracking':
+      return 'Cette branche ne suit aucune branche distante : précisez-la (git pull origin main) ou poussez-la avec git push -u.';
+    case 'branch-upstream':
+      return `${info.name} suit désormais ${info.upstream} : git status, git pull et git push savent avec quelle branche distante comparer.`;
+    case 'branch-unset-upstream':
+      return `${info.name} ne suit plus aucune branche distante.`;
+    case 'collab':
+      return `Un collègue a poussé sur ${info.remote}/${info.branch} : votre dépôt local ne le sait pas encore. git fetch pour le voir, git pull pour le récupérer et le fusionner.`;
+    case 'mr':
+      return `La fusion a eu lieu sur la forge, pas chez vous : faites git switch ${info.into} puis git pull pour récupérer le commit de fusion ${info.id}.`;
+    case 'mr-conflict':
+      return 'La forge ne sait pas résoudre un conflit : il faut le régler en local, sur votre branche, puis pousser de nouveau.';
     case 'merge-conflict':
       return `Conflit : les deux branches ont modifié ${list(info.paths)} différemment. Corrigez (par exemple echo "…" > ${info.paths[0]}), puis git add et git commit, ou annulez avec git merge --abort.`;
     case 'merge-abort':
@@ -800,7 +1104,7 @@ function candidatesFor(state, words, prefix) {
   if (prefix.startsWith('-')) {
     return Object.keys(def.options ?? {}).map((o) => (o.length === 1 ? `-${o}` : `--${o}`));
   }
-  return def.complete ? def.complete(state) : [];
+  return def.complete ? def.complete(state, words.slice(2), prefix) : [];
 }
 
 /** Informations pour l'invite `~/projet (main) $`. */

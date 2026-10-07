@@ -55,9 +55,19 @@ export function computeLayout(state) {
   const rank = (lane) => (lane === DETACHED ? Infinity : repo.lanes.indexOf(lane));
   const lanes = [...new Set(commits.map(laneOf))].sort((a, b) => rank(a) - rank(b));
 
-  // Pile d'étiquettes au-dessus de chaque commit, de bas en haut : autres branches, branche courante, HEAD.
+  // Pile d'étiquettes au-dessus de chaque commit, de bas en haut :
+  // branches de suivi (origin/…), autres branches, branche courante, HEAD.
   const refs = new Map();
   const addRef = (id, ref) => refs.set(id, [...(refs.get(id) ?? []), ref]);
+  const shortName = (ref) => ref.slice(ref.indexOf('/') + 1);
+  for (const ref of Object.keys(repo.remoteRefs).sort()) {
+    addRef(repo.remoteRefs[ref], {
+      key: `remote:${ref}`,
+      text: ref,
+      kind: 'remote',
+      color: branchColor(repo, shortName(ref)),
+    });
+  }
   for (const name of Object.keys(repo.branches).sort()) {
     if (name !== current)
       addRef(repo.branches[name], {
@@ -127,7 +137,10 @@ export function computeLayout(state) {
     y: laneY.get(lane),
     name: lane === DETACHED ? 'HEAD détachée' : lane,
     color: lane === DETACHED ? DETACHED_COLOR : branchColor(repo, lane),
-    deleted: lane !== DETACHED && !Object.prototype.hasOwnProperty.call(repo.branches, lane),
+    deleted:
+      lane !== DETACHED &&
+      !Object.prototype.hasOwnProperty.call(repo.branches, lane) &&
+      !Object.keys(repo.remoteRefs).some((ref) => shortName(ref) === lane),
   }));
   return {
     nodes,
@@ -309,6 +322,9 @@ export function createGraph(root, { onCommitClick = null } = {}) {
       rect.setAttribute('width', label.width);
       if (label.color) rect.setAttribute('fill', label.color);
       else rect.removeAttribute('fill');
+      // Branche de suivi : contour pointillé et texte de la couleur de la branche, fond neutre.
+      rect.style.stroke = label.kind === 'remote' ? label.color : '';
+      text.style.fill = label.kind === 'remote' ? label.color : '';
       text.setAttribute('x', label.width / 2);
       text.textContent = label.text;
       g.style.transform = `translate(${label.x}px, ${label.y}px)`;

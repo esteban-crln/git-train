@@ -303,6 +303,16 @@ button {
   fill: #f0883e;
 }
 
+.ref-remote rect {
+  fill: var(--bg);
+  stroke-width: 1.5;
+  stroke-dasharray: 4 3;
+}
+
+.ref-remote text {
+  font-weight: 500;
+}
+
 .ref-tag rect {
   fill: transparent;
   stroke: var(--text);
@@ -577,6 +587,7 @@ button {
 .zone-workdir .zone-num { background: var(--danger); }
 .zone-index .zone-num { background: var(--ok); }
 .zone-repo .zone-num { background: var(--accent); }
+.zone-remote .zone-num { background: #f0883e; }
 
 .zone-hint {
   margin: 2px 0 10px;
@@ -707,6 +718,17 @@ div.file-row .file-name::before {
 
 .branch code {
   color: var(--muted);
+}
+
+.branch .tag {
+  grid-column: 2 / -1;
+  justify-self: start;
+}
+
+.remote-url {
+  color: var(--muted);
+  font-size: 0.8rem;
+  overflow-wrap: anywhere;
 }
 
 .branch-msg {

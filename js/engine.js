@@ -12,20 +12,8 @@ export const STATE_VERSION = 1;
 export const DEFAULT_BRANCH = 'main';
 export const REPO_PATH = '/home/apprenant/projet';
 
-// Prévues par l'architecture (état réservé : tags, stash, remotes), pas encore simulées.
-export const PLANNED_COMMANDS = [
-  'reset',
-  'revert',
-  'cherry-pick',
-  'stash',
-  'tag',
-  'rebase',
-  'remote',
-  'fetch',
-  'pull',
-  'push',
-  'clone',
-];
+// Prévues par l'architecture (état réservé : tags, stash), pas encore simulées.
+export const PLANNED_COMMANDS = ['reset', 'revert', 'cherry-pick', 'stash', 'tag', 'rebase'];
 
 const DEFAULT_USER = Object.freeze({ name: 'Apprenant', email: 'apprenant@exemple.fr' });
 const NOT_A_REPO = 'fatal: not a git repository (or any of the parent directories): .git';
@@ -44,12 +32,12 @@ export const defaultEnv = {
 
 /* ------------------------------------------------------------------ utilitaires */
 
-const hasOwn = (obj, key) => Object.prototype.hasOwnProperty.call(obj, key);
-const get = (obj, key) => (hasOwn(obj, key) ? obj[key] : undefined);
-const byteOrder = (a, b) => (a < b ? -1 : a > b ? 1 : 0);
-const keysOf = (...objects) => [...new Set(objects.flatMap((o) => Object.keys(o)))].sort(byteOrder);
-const plural = (n, word) => `${n} ${word}${n === 1 ? '' : 's'}`;
-const isPlainObject = (v) => v !== null && typeof v === 'object' && !Array.isArray(v);
+export const hasOwn = (obj, key) => Object.prototype.hasOwnProperty.call(obj, key);
+export const get = (obj, key) => (hasOwn(obj, key) ? obj[key] : undefined);
+export const byteOrder = (a, b) => (a < b ? -1 : a > b ? 1 : 0);
+export const keysOf = (...objects) => [...new Set(objects.flatMap((o) => Object.keys(o)))].sort(byteOrder);
+export const plural = (n, word) => `${n} ${word}${n === 1 ? '' : 's'}`;
+export const isPlainObject = (v) => v !== null && typeof v === 'object' && !Array.isArray(v);
 const isStringMap = (v) => isPlainObject(v) && Object.values(v).every((x) => typeof x === 'string');
 
 export function clone(value) {
@@ -66,17 +54,84 @@ export function splitLines(content) {
 function result(state, out, ok, info = null) {
   return { state, out: typeof out === 'string' ? out.split('\n') : out, ok, info };
 }
-const success = (state, out = [], info = null) => result(state, out, true, info);
-const failure = (state, out, info = null) => result(state, out, false, info);
-const requireRepo = (state) => (state.repo ? null : failure(state, NOT_A_REPO, { kind: 'not-a-repo' }));
+export const success = (state, out = [], info = null) => result(state, out, true, info);
+export const failure = (state, out, info = null) => result(state, out, false, info);
+export const requireRepo = (state) => (state.repo ? null : failure(state, NOT_A_REPO, { kind: 'not-a-repo' }));
 
 /* ------------------------------------------------------------------ état */
 
-export function createState() {
-  return { version: STATE_VERSION, user: { ...DEFAULT_USER }, workdir: {}, repo: null };
+export const DEMO_URL = 'https://github.com/camille/demo.git';
+export const COLLEAGUE = Object.freeze({ name: 'Camille', email: 'camille@exemple.fr' });
+
+/** Dépôt distant vide, tel qu'un nouveau dépôt GitHub. */
+export function emptyServer() {
+  return { head: DEFAULT_BRANCH, branches: {}, commits: {}, seq: 0 };
 }
 
-function createRepo() {
+/** Dépôt de démonstration que `git clone` peut récupérer. */
+function seedServer() {
+  const steps = [
+    {
+      id: 'a1b2c3d',
+      message: 'Initial commit',
+      parent: null,
+      lane: 'main',
+      file: ['README.md', "# Demo\nProjet d'exemple hébergé sur GitHub (simulé).\n"],
+    },
+    {
+      id: 'b2c3d4e',
+      message: "Ajoute la page d'accueil",
+      parent: 'a1b2c3d',
+      lane: 'main',
+      file: ['index.html', '<h1>Demo</h1>\n'],
+    },
+    {
+      id: 'c3d4e5f',
+      message: 'Ajoute le style',
+      parent: 'b2c3d4e',
+      lane: 'main',
+      file: ['style.css', 'body { margin: 0; }\n'],
+    },
+    {
+      id: 'd4e5f6a',
+      message: 'Début de la page contact',
+      parent: 'c3d4e5f',
+      lane: 'feature',
+      file: ['contact.html', '<h1>Contact</h1>\n'],
+    },
+  ];
+  const server = emptyServer();
+  server.branches = { main: 'c3d4e5f', feature: 'd4e5f6a' };
+  steps.forEach((step, i) => {
+    const parent = step.parent ? server.commits[step.parent] : null;
+    server.commits[step.id] = {
+      id: step.id,
+      hash: `${step.id}0123456789abcdef0123456789abcdef01234`.slice(0, 40),
+      message: step.message,
+      parents: parent ? [parent.id] : [],
+      author: { ...COLLEAGUE },
+      timestamp: Date.UTC(2026, 8, 1 + i, 10, 0, 0),
+      tree: { ...(parent?.tree ?? {}), [step.file[0]]: step.file[1] },
+      lane: step.lane,
+      seq: ++server.seq,
+    };
+  });
+  return server;
+}
+
+export function createState() {
+  return {
+    version: STATE_VERSION,
+    user: { ...DEFAULT_USER },
+    workdir: {},
+    repo: null,
+    config: {}, // réglages de git config autres que user.* (pull.rebase, pull.ff)
+    // « GitHub » : les dépôts distants que les URL peuvent désigner, indexés par URL.
+    servers: { [DEMO_URL]: seedServer() },
+  };
+}
+
+export function createRepo() {
   return {
     head: { type: 'branch', name: DEFAULT_BRANCH },
     previousHead: null,
@@ -89,13 +144,36 @@ function createRepo() {
     lanes: [DEFAULT_BRANCH],
     tags: {},
     stash: [],
-    remotes: {},
+    remotes: {}, // nom -> { url }
+    remoteRefs: {}, // branches de suivi : 'origin/main' -> id de commit
+    upstreams: {}, // branche locale -> branche de suivi
   };
 }
+
+const validServer = (sv) =>
+  isPlainObject(sv) &&
+  typeof sv.head === 'string' &&
+  typeof sv.seq === 'number' &&
+  isPlainObject(sv.commits) &&
+  isStringMap(sv.branches) &&
+  Object.values(sv.branches).every((id) => hasOwn(sv.commits, id)) &&
+  Object.entries(sv.commits).every(
+    ([id, c]) =>
+      isPlainObject(c) &&
+      c.id === id &&
+      typeof c.hash === 'string' &&
+      typeof c.message === 'string' &&
+      typeof c.seq === 'number' &&
+      isPlainObject(c.author) &&
+      Array.isArray(c.parents) &&
+      c.parents.every((p) => hasOwn(sv.commits, p)) &&
+      isStringMap(c.tree),
+  );
 
 export function isValidState(s) {
   if (!isPlainObject(s) || s.version !== STATE_VERSION || !isStringMap(s.workdir) || !isPlainObject(s.user))
     return false;
+  if (!isPlainObject(s.servers) || !Object.values(s.servers).every(validServer) || !isStringMap(s.config)) return false;
   if (s.repo === null) return true;
   const r = s.repo;
   if (!isPlainObject(r) || !isPlainObject(r.commits) || !isStringMap(r.branches) || !isStringMap(r.index)) return false;
@@ -112,6 +190,11 @@ export function isValidState(s) {
     isPlainObject(c.author);
   if (!Object.entries(r.commits).every(commitOk)) return false;
   if (!Object.values(r.branches).every((id) => hasOwn(r.commits, id))) return false;
+  const remotesOk =
+    isPlainObject(r.remotes) &&
+    Object.values(r.remotes).every((x) => isPlainObject(x) && typeof x.url === 'string' && hasOwn(s.servers, x.url));
+  if (!remotesOk || !isStringMap(r.remoteRefs) || !isStringMap(r.upstreams)) return false;
+  if (!Object.values(r.remoteRefs).every((id) => hasOwn(r.commits, id))) return false;
   if (
     r.merge !== null &&
     !(isPlainObject(r.merge) && hasOwn(r.commits, r.merge.theirs) && isPlainObject(r.merge.conflicts))
@@ -123,14 +206,37 @@ export function isValidState(s) {
   return h.type === 'detached' && hasOwn(r.commits, h.commit);
 }
 
+/** Complète un état enregistré par une version plus ancienne du simulateur. */
+export function normalizeState(state) {
+  if (!isPlainObject(state)) return state;
+  const s = { ...state };
+  if (!isPlainObject(s.servers)) s.servers = { [DEMO_URL]: seedServer() };
+  if (!isPlainObject(s.config)) s.config = {};
+  if (isPlainObject(s.repo)) {
+    s.repo = {
+      previousHead: null,
+      merge: null,
+      tags: {},
+      stash: [],
+      remotes: {},
+      remoteRefs: {},
+      upstreams: {},
+      ...s.repo,
+    };
+    for (const remote of Object.values(s.repo.remotes)) {
+      if (isPlainObject(remote) && typeof remote.url === 'string' && !hasOwn(s.servers, remote.url)) {
+        s.servers = { ...s.servers, [remote.url]: emptyServer() };
+      }
+    }
+  }
+  return s;
+}
+
 export const serialize = (state) => JSON.stringify(state);
 
 export function deserialize(json) {
   try {
-    const state = JSON.parse(json);
-    if (isPlainObject(state?.repo)) {
-      state.repo = { previousHead: null, merge: null, tags: {}, stash: [], remotes: {}, ...state.repo };
-    }
+    const state = normalizeState(JSON.parse(json));
     return isValidState(state) ? state : null;
   } catch {
     return null;
@@ -141,7 +247,10 @@ export function deserialize(json) {
 export class UndoStack {
   constructor(entries = [], limit = 50) {
     this.limit = limit;
-    this.entries = (Array.isArray(entries) ? entries : []).filter((e) => e && isValidState(e.state)).slice(-limit);
+    this.entries = (Array.isArray(entries) ? entries : [])
+      .map((e) => (e && typeof e === 'object' ? { ...e, state: normalizeState(e.state) } : null))
+      .filter((e) => e && isValidState(e.state))
+      .slice(-limit);
   }
   push(state, label) {
     this.entries.push({ state, label });
@@ -181,7 +290,7 @@ export function ancestors(repo, ...ids) {
   return seen;
 }
 
-const isAncestor = (repo, ancestor, of) => ancestors(repo, of).has(ancestor);
+export const isAncestor = (repo, ancestor, of) => ancestors(repo, of).has(ancestor);
 
 function mergeBase(repo, a, b) {
   const fromA = ancestors(repo, a);
@@ -194,7 +303,13 @@ function mergeBase(repo, a, b) {
 
 /** Commits accessibles depuis une référence ; les autres sont « orphelins ». */
 export function reachableCommits(repo) {
-  return ancestors(repo, ...Object.values(repo.branches), ...Object.values(repo.tags), headCommitId(repo));
+  return ancestors(
+    repo,
+    ...Object.values(repo.branches),
+    ...Object.values(repo.remoteRefs),
+    ...Object.values(repo.tags),
+    headCommitId(repo),
+  );
 }
 
 function findCommitByPrefix(repo, prefix) {
@@ -211,6 +326,7 @@ export function resolveRevision(repo, rev) {
   let id;
   if (base === 'HEAD' || base === '@') id = headCommitId(repo);
   else if (hasOwn(repo.branches, base)) id = repo.branches[base];
+  else if (hasOwn(repo.remoteRefs, base)) id = repo.remoteRefs[base];
   else id = findCommitByPrefix(repo, base);
   for (const [, op, digits] of suffix.matchAll(/([~^])(\d*)/g)) {
     if (!id) return null;
@@ -227,6 +343,59 @@ export function isValidBranchName(name) {
   if (name.includes('..') || name.includes('@{') || name.includes('//')) return false;
   if (name.split('/').some((part) => part.startsWith('.'))) return false;
   return !/[\s~^:?*[\\\x00-\x1f\x7f]/.test(name);
+}
+
+/** Écart entre une branche locale et sa branche de suivi : { upstream, gone, ahead, behind }. */
+export function trackingInfo(repo, branch) {
+  const upstream = get(repo.upstreams, branch);
+  if (!upstream) return null;
+  const remoteId = get(repo.remoteRefs, upstream);
+  if (!remoteId) return { upstream, gone: true, ahead: 0, behind: 0 };
+  const mine = ancestors(repo, get(repo.branches, branch));
+  const theirs = ancestors(repo, remoteId);
+  return {
+    upstream,
+    gone: false,
+    ahead: [...mine].filter((id) => !theirs.has(id)).length,
+    behind: [...theirs].filter((id) => !mine.has(id)).length,
+  };
+}
+
+/** « ahead 1, behind 2 », « gone » ou une chaîne vide quand tout est à jour. */
+export function trackingBrief(info) {
+  if (info.gone) return 'gone';
+  return [info.ahead && `ahead ${info.ahead}`, info.behind && `behind ${info.behind}`].filter(Boolean).join(', ');
+}
+
+function trackingLines(info) {
+  const { upstream: up, ahead, behind } = info;
+  if (info.gone)
+    return [
+      `Your branch is based on '${up}', but the upstream is gone.`,
+      '  (use "git branch --unset-upstream" to fixup)',
+    ];
+  if (!ahead && !behind) return [`Your branch is up to date with '${up}'.`];
+  if (!behind)
+    return [
+      `Your branch is ahead of '${up}' by ${plural(ahead, 'commit')}.`,
+      '  (use "git push" to publish your local commits)',
+    ];
+  if (!ahead) {
+    return [
+      `Your branch is behind '${up}' by ${plural(behind, 'commit')}, and can be fast-forwarded.`,
+      '  (use "git pull" to update your local branch)',
+    ];
+  }
+  return [
+    `Your branch and '${up}' have diverged,`,
+    `and have ${ahead} and ${behind} different commits each, respectively.`,
+    '  (use "git pull" if you want to integrate the remote branch with yours)',
+  ];
+}
+
+function branchTrackingLines(repo, name) {
+  const info = trackingInfo(repo, name);
+  return info ? trackingLines(info) : [];
 }
 
 /** Compare HEAD, l'index et le répertoire de travail (le cœur de `git status`). */
@@ -504,6 +673,8 @@ function statusLines(state, { forCommit = false } = {}) {
   const st = computeStatus(state);
   const initial = !headCommitId(repo);
   const out = [headLine(repo)];
+  const tracking = repo.head.type === 'branch' ? branchTrackingLines(repo, repo.head.name) : [];
+  if (tracking.length) out.push(...tracking, '');
   if (repo.merge) {
     if (st.unmerged.length)
       out.push(
@@ -578,7 +749,15 @@ function shortStatusLines(state, withBranch) {
   if (withBranch) {
     if (repo.head.type === 'detached') out.push(['## ', ['HEAD (no branch)', 'red']]);
     else if (!headCommitId(repo)) out.push(['## No commits yet on ', [repo.head.name, 'green']]);
-    else out.push(['## ', [repo.head.name, 'green']]);
+    else {
+      const tracking = trackingInfo(repo, repo.head.name);
+      const brief = tracking ? trackingBrief(tracking) : '';
+      out.push([
+        '## ',
+        [repo.head.name, 'green'],
+        ...(tracking ? ['...', [tracking.upstream, 'red'], ...(brief ? [` [${brief}]`] : [])] : []),
+      ]);
+    }
   }
   for (const [path, r] of [...rows].sort(([a], [b]) => byteOrder(a, b))) {
     out.push([[r.x, r.conflict ? 'red' : 'green'], [r.y, 'red'], ` ${path}`]);
@@ -738,6 +917,11 @@ function gitDate(timestamp) {
 function decoration(repo, id) {
   const items = [];
   const current = currentBranch(repo);
+  const at = (refs) =>
+    Object.keys(refs)
+      .filter((name) => refs[name] === id)
+      .sort(byteOrder)
+      .reverse();
   if (headCommitId(repo) === id)
     items.push(
       current
@@ -747,12 +931,9 @@ function decoration(repo, id) {
           ]
         : [['HEAD', 'cyan bold']],
     );
-  for (const name of Object.keys(repo.branches).sort(byteOrder)) {
-    if (repo.branches[name] === id && name !== current) items.push([[name, 'green bold']]);
-  }
-  for (const name of Object.keys(repo.tags).sort(byteOrder)) {
-    if (repo.tags[name] === id) items.push([[`tag: ${name}`, 'yellow bold']]);
-  }
+  for (const name of at(repo.tags)) items.push([[`tag: ${name}`, 'yellow bold']]);
+  for (const name of at(repo.remoteRefs)) items.push([[name, 'red bold']]);
+  for (const name of at(repo.branches)) if (name !== current) items.push([[name, 'green bold']]);
   if (!items.length) return [];
   return [[' (', 'yellow'], ...items.flatMap((item, i) => (i ? [[', ', 'yellow'], ...item] : item)), [')', 'yellow']];
 }
@@ -849,7 +1030,8 @@ export function log(state, { oneline = false, graph = false, all = false, revs =
   if (error) return error;
   const repo = state.repo;
   let tips = [];
-  if (all) tips = [...Object.values(repo.branches), headCommitId(repo)].filter(Boolean);
+  if (all)
+    tips = [...Object.values(repo.branches), ...Object.values(repo.remoteRefs), headCommitId(repo)].filter(Boolean);
   else if (revs.length) {
     for (const rev of revs) {
       const id = resolveRevision(repo, rev);
@@ -904,26 +1086,49 @@ function addBranch(repo, name, id) {
   for (let c = repo.commits[id]; c && c.lane === null; c = repo.commits[c.parents[0]]) c.lane = name;
 }
 
-export function branchList(state, { verbose = false } = {}) {
+export function branchList(state, { verbose = 0, remotes = false, all = false } = {}) {
   const error = requireRepo(state);
   if (error) return error;
   const repo = state.repo;
   const current = currentBranch(repo);
-  const entries = Object.keys(repo.branches)
-    .sort(byteOrder)
-    .map((name) => ({ name, current: name === current, id: repo.branches[name] }));
-  if (repo.head.type === 'detached') {
-    const { commit: at, from } = repo.head;
-    entries.unshift({ name: `(HEAD detached ${at === from ? 'at' : 'from'} ${from})`, current: true, id: at });
+  const level = Number(verbose);
+  const entries = [];
+  if (!remotes || all) {
+    entries.push(
+      ...Object.keys(repo.branches)
+        .sort(byteOrder)
+        .map((name) => ({ name, current: name === current, id: repo.branches[name] })),
+    );
+    if (repo.head.type === 'detached') {
+      const { commit: at, from } = repo.head;
+      entries.unshift({ name: `(HEAD detached ${at === from ? 'at' : 'from'} ${from})`, current: true, id: at });
+    }
+  }
+  if (remotes || all) {
+    entries.push(
+      ...Object.keys(repo.remoteRefs)
+        .sort(byteOrder)
+        .map((ref) => ({ name: all ? `remotes/${ref}` : ref, remote: true, id: repo.remoteRefs[ref] })),
+    );
   }
   const width = Math.max(0, ...entries.map((e) => e.name.length));
   const out = entries.map((e) => {
-    const name = verbose ? e.name.padEnd(width) : e.name;
-    const line = [e.current ? '* ' : '  ', e.current ? [name, 'green'] : name];
-    if (verbose) line.push(` ${e.id} ${subject(repo.commits[e.id])}`);
+    const name = level ? e.name.padEnd(width) : e.name;
+    const line = [e.current ? '* ' : '  ', e.current ? [name, 'green'] : e.remote ? [name, 'red'] : name];
+    if (level) {
+      const tracking = level > 1 && !e.remote && e.current !== undefined ? trackingInfo(repo, e.name) : null;
+      const brief = tracking ? trackingBrief(tracking) : '';
+      const label = tracking ? `[${tracking.upstream}${brief ? `: ${brief}` : ''}] ` : '';
+      line.push(` ${e.id} ${label}${subject(repo.commits[e.id])}`);
+    }
     return line;
   });
-  return success(state, out, { kind: 'branch-list', count: Object.keys(repo.branches).length, current });
+  return success(state, out, {
+    kind: 'branch-list',
+    count: Object.keys(repo.branches).length,
+    current,
+    remotes: remotes || all,
+  });
 }
 
 export function branchCreate(state, { name, start = null }) {
@@ -936,7 +1141,15 @@ export function branchCreate(state, { name, start = null }) {
   if (!id) return failure(state, `fatal: not a valid object name: '${start ?? currentBranch(repo) ?? 'HEAD'}'`);
   const s = clone(state);
   addBranch(s.repo, name, id);
-  return success(s, [], { kind: 'branch-create', name, id, current: currentBranch(repo) });
+  const tracking = start !== null && hasOwn(repo.remoteRefs, start) ? start : null;
+  if (tracking) s.repo.upstreams[name] = tracking;
+  return success(s, tracking ? `branch '${name}' set up to track '${tracking}'.` : [], {
+    kind: 'branch-create',
+    name,
+    id,
+    current: currentBranch(repo),
+    tracking,
+  });
 }
 
 export function branchDelete(state, { names = [], force = false }) {
@@ -966,6 +1179,7 @@ export function branchDelete(state, { names = [], force = false }) {
     } else {
       out.push(`Deleted branch ${name} (was ${repo.branches[name]}).`);
       delete repo.branches[name];
+      delete repo.upstreams[name];
       deleted.push(name);
     }
   }
@@ -975,6 +1189,26 @@ export function branchDelete(state, { names = [], force = false }) {
     ok,
     deleted.length ? { kind: 'branch-delete', names: deleted, force } : null,
   );
+}
+
+export function branchSetUpstream(state, { upstream = null, branch = null, unset = false }) {
+  const error = requireRepo(state);
+  if (error) return error;
+  const repo = state.repo;
+  const name = branch ?? currentBranch(repo);
+  if (!name) return failure(state, 'fatal: HEAD does not point to a branch');
+  if (!hasOwn(repo.branches, name)) return failure(state, `fatal: branch '${name}' does not exist`);
+  const s = clone(state);
+  if (unset) {
+    if (!hasOwn(repo.upstreams, name)) return failure(state, `fatal: Branch '${name}' has no upstream information`);
+    delete s.repo.upstreams[name];
+    return success(s, [], { kind: 'branch-unset-upstream', name });
+  }
+  if (!hasOwn(repo.remoteRefs, upstream)) {
+    return failure(state, `fatal: the requested upstream branch '${upstream}' does not exist`);
+  }
+  s.repo.upstreams[name] = upstream;
+  return success(s, `branch '${name}' set up to track '${upstream}'.`, { kind: 'branch-upstream', name, upstream });
 }
 
 /* ------------------------------------------------------------------ git checkout / switch */
@@ -1120,6 +1354,7 @@ function moveHeadTo(state, target, { created = false, startId = null, rev = null
   if (oldHead.type === 'detached' && oldId !== newId) out.push(...leavingDetachedLines(repo, oldId));
   if (target.branch) {
     out.push(created ? `Switched to a new branch '${target.branch}'` : `Switched to branch '${target.branch}'`);
+    if (!created) out.push(...branchTrackingLines(repo, target.branch));
     return success(s, out, { kind: created ? 'switch-create' : 'switch', branch: target.branch, id: newId });
   }
   if (advice && oldHead.type === 'branch') out.push(...detachedAdvice(rev));
@@ -1129,7 +1364,14 @@ function moveHeadTo(state, target, { created = false, startId = null, rev = null
 
 function switchToBranch(state, name) {
   if (name === currentBranch(state.repo)) {
-    return success(state, [...localChangeLines(state), `Already on '${name}'`], { kind: 'already-on', branch: name });
+    return success(
+      state,
+      [...localChangeLines(state), `Already on '${name}'`, ...branchTrackingLines(state.repo, name)],
+      {
+        kind: 'already-on',
+        branch: name,
+      },
+    );
   }
   return moveHeadTo(state, { branch: name });
 }
@@ -1150,7 +1392,19 @@ function createAndSwitch(state, name, start, mode) {
       );
     }
   }
-  return moveHeadTo(state, { branch: name }, { created: true, startId });
+  const res = moveHeadTo(state, { branch: name }, { created: true, startId });
+  if (res.ok && start !== null && hasOwn(repo.remoteRefs, start)) {
+    res.state.repo.upstreams[name] = start;
+    res.out = [`branch '${name}' set up to track '${start}'.`, ...res.out];
+    res.info = { ...res.info, tracking: start };
+  }
+  return res;
+}
+
+/** `git checkout feature` crée une branche locale qui suit origin/feature si elle existe côté distant. */
+function remoteBranchFor(repo, name) {
+  const refs = Object.keys(repo.remoteRefs).filter((ref) => ref.slice(ref.indexOf('/') + 1) === name);
+  return refs.length === 1 ? refs[0] : null;
 }
 
 function switchToPrevious(state, mode) {
@@ -1190,6 +1444,8 @@ export function checkout(state, { target = null, newBranch = null, paths = [], d
   if (target === null || target === 'HEAD') return success(state, localChangeLines(state));
   if (target === '-') return switchToPrevious(state, 'checkout');
   if (!detach && hasOwn(repo.branches, target)) return switchToBranch(state, target);
+  const tracked = detach ? null : remoteBranchFor(repo, target);
+  if (tracked) return createAndSwitch(state, target, tracked, 'checkout');
   const id = resolveRevision(repo, target);
   if (id) return moveHeadTo(state, { commit: id }, { rev: target, advice: !detach });
   if (hasOwn(repo.index, target)) return checkoutPaths(state, [target]);
@@ -1209,6 +1465,8 @@ export function switchBranch(state, { target = null, create = null, detach = fal
   if (target === null) return failure(state, 'fatal: missing branch or commit argument');
   if (target === '-') return switchToPrevious(state, 'switch');
   if (hasOwn(repo.branches, target)) return switchToBranch(state, target);
+  const tracked = remoteBranchFor(repo, target);
+  if (tracked) return createAndSwitch(state, target, tracked, 'switch');
   if (resolveRevision(repo, target)) {
     return failure(state, [
       `fatal: a branch is expected, got commit '${target}'`,
@@ -1416,4 +1674,66 @@ export function diff(state, { staged = false, paths = [] } = {}) {
   const unmerged = keysOf(conflicts).filter((p) => !paths.length || paths.includes(p));
   const out = [...unmerged.map((p) => `* Unmerged path ${p}`), ...changes.flatMap(fileDiffLines)];
   return success(state, out, { kind: 'diff', staged, empty: !out.length });
+}
+
+/* ------------------------------------------------------------------ git config */
+
+// Seules ces clés sont simulées ; les valeurs autorisées sont listées quand elles sont contraintes.
+export const CONFIG_KEYS = {
+  'user.name': null,
+  'user.email': null,
+  'pull.rebase': ['true', 'false'],
+  'pull.ff': ['only', 'true', 'false'],
+};
+
+function configEntries(state) {
+  const entries = [
+    ['user.name', state.user.name],
+    ['user.email', state.user.email],
+    ['init.defaultbranch', DEFAULT_BRANCH],
+    ...Object.entries(state.config),
+  ];
+  const repo = state.repo;
+  if (repo) {
+    entries.push(['core.repositoryformatversion', '0'], ['core.bare', 'false']);
+    for (const name of Object.keys(repo.remotes).sort(byteOrder)) {
+      entries.push(
+        [`remote.${name}.url`, repo.remotes[name].url],
+        [`remote.${name}.fetch`, `+refs/heads/*:refs/remotes/${name}/*`],
+      );
+    }
+    for (const branch of Object.keys(repo.upstreams).sort(byteOrder)) {
+      const ref = repo.upstreams[branch];
+      const slash = ref.indexOf('/');
+      entries.push(
+        [`branch.${branch}.remote`, ref.slice(0, slash)],
+        [`branch.${branch}.merge`, `refs/heads/${ref.slice(slash + 1)}`],
+      );
+    }
+  }
+  return entries;
+}
+
+export function config(state, { key = null, value = null, list = false, global = false } = {}) {
+  if (list)
+    return success(
+      state,
+      configEntries(state).map(([k, v]) => `${k}=${v}`),
+      { kind: 'config-list' },
+    );
+  const name = key.toLowerCase();
+  if (value === null) {
+    const found = configEntries(state).find(([k]) => k === name);
+    return found ? success(state, [found[1]], { kind: 'config-get', key: name }) : failure(state, []);
+  }
+  if (!global && !state.repo) return failure(state, 'fatal: not in a git directory');
+  const allowed = CONFIG_KEYS[name];
+  if (allowed && !allowed.includes(value.toLowerCase())) {
+    return failure(state, `fatal: bad boolean config value '${value}' for '${name}'`);
+  }
+  const s = clone(state);
+  if (name === 'user.name') s.user.name = value;
+  else if (name === 'user.email') s.user.email = value;
+  else s.config[name] = value.toLowerCase();
+  return success(s, [], { kind: 'config-set', key: name, value });
 }

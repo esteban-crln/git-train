@@ -26,6 +26,7 @@ GitHub Pages…).
 ├── README.md
 └── js/
     ├── engine.js    moteur Git simulé (état JSON, commandes pures, pile d'annulation), sans DOM
+    ├── remote.js    dépôt distant simulé : remote, fetch, push, pull, clone, collègue, merge request
     ├── parser.js    mini-shell : découpage de la saisie, options, sortie texte, explications
     ├── graph.js     rendu SVG du graphe (couleurs stables, étiquettes, HEAD, infobulles)
     ├── terminal.js  saisie, historique ↑/↓, autocomplétion Tab, affichage coloré
@@ -38,7 +39,19 @@ GitHub Pages…).
   (`-m`, `-a`, `-am`, `--allow-empty`), `log` (`--oneline`, `--graph`, `--all`, `-n`), `branch`
   (liste, `-v`, création, `-d`, `-D`), `checkout` (`-b`, commit → HEAD détachée, `-- <fichier>`),
   `switch` (`-c`, `--detach`, `-`), `merge` (avance rapide, commit de fusion, `--no-ff`,
-  `--ff-only`, conflits avec `--abort`), `diff` (`--staged`), `help`.
+  `--ff-only`, conflits avec `--abort`), `diff` (`--staged`), `config` (`user.name`, `user.email`,
+  `pull.rebase`, `pull.ff`, `--list`), `help`.
+- **Dépôt distant** : `clone`, `remote` (`-v`, `add`, `remove`), `fetch` (`--all`, `--prune`),
+  `push` (`-u`, `-f`, `--delete`, refus « fetch first » / « non-fast-forward »), `pull`
+  (`--no-rebase`, `--ff-only`, refus des branches divergentes comme Git ≥ 2.34), branches de suivi
+  `origin/…`, `branch -r`, `-a`, `-vv`, `-u`, `--unset-upstream`, `checkout <branche distante>` qui
+  crée la branche locale suivie, avance et retard dans `git status`.
+- **Forge simulée** : un dépôt de démonstration (`git clone https://github.com/camille/demo.git`) ;
+  toute autre URL donnée à `git remote add` crée un dépôt distant vide. Deux commandes
+  pédagogiques : `collab [branche] [fichier]` (une collègue pousse un commit) et
+  `mr <branche> [cible]` (la merge request est acceptée sur la forge, avec un commit de fusion).
+  Les formes abrégées du cours (`git push main`, `git remote add <url>`) reçoivent l'erreur de Git
+  suivie de la forme complète.
 - **Fichiers simulés** : `touch`, `echo "texte" > f`, `echo "texte" >> f`, `cat`, `ls [-a]`, `rm`,
   `clear`, `help`. Les commandes s'enchaînent avec `&&` ou `;`, et `*` est développé.
 - Les **messages reprennent ceux de Git** (`nothing to commit, working tree clean`,
@@ -51,7 +64,9 @@ GitHub Pages…).
   marqueur HEAD, animation d'apparition (300 ms), infobulle (hash, message, auteur, date),
   clic sur un commit pour insérer son hash dans le terminal. Les commits devenus inaccessibles
   restent affichés en transparence.
-- **Panneau « Zones Git »** (replié au départ) : répertoire de travail, staging area, dépôt local.
+- **Panneau « Zones Git »** (replié au départ) : répertoire de travail, staging area, dépôt local
+  (avec l'avance ↑ et le retard ↓ de chaque branche sur sa branche distante) et dépôt distant.
+- Dans le graphe, les **branches de suivi** (`origin/main`…) ont une étiquette en pointillé.
 - **Annuler la dernière commande** (pile de 50 états), **Réinitialiser**, **Aide**.
 - **Sauvegarde automatique** dans le `localStorage` (état, pile d'annulation, historique).
 
@@ -59,17 +74,18 @@ GitHub Pages…).
 
 - L'état est un objet JSON : `workdir`, et `repo` avec `commits` (id court, hash, message,
   parents, auteur, horodatage, arbre de fichiers), `branches`, `head` (rattachée ou détachée),
-  `index` et `merge` (fusion en cours). Il est validé au chargement : une sauvegarde corrompue
-  est ignorée.
+  `index`, `merge` (fusion en cours), `remotes`, `remoteRefs` (branches de suivi) et `upstreams`
+  (branche suivie par chaque branche locale). `servers` contient les dépôts distants, indexés par
+  URL : c'est la forge simulée. L'état est validé au chargement : une sauvegarde corrompue est
+  ignorée, et une sauvegarde d'une version précédente est complétée.
 - Chaque commande du moteur reçoit un état et renvoie `{ state, out, ok, info }` sans modifier
   l'état reçu. L'horloge et le hasard sont injectables (`env`), ce qui rend le moteur testable
   hors navigateur. `parser.execute` intercepte toute exception : une commande invalide ne peut
   pas corrompre l'état.
-- **Commandes prévues** : `reset`, `revert`, `cherry-pick`, `stash`, `tag`, `rebase`, `remote`
-  (ainsi que `fetch`, `pull`, `push`, `clone` pour un `origin` simulé). Elles sont déclarées dans
-  `PLANNED_COMMANDS`, l'état réserve déjà `tags`, `stash` et `remotes`, et le graphe sait afficher
-  des étiquettes de tag. Pour en ajouter une : écrire la fonction dans `engine.js`, puis la
-  déclarer dans le registre `GIT` de `parser.js`.
+- **Commandes prévues** : `reset`, `revert`, `cherry-pick`, `stash`, `tag`, `rebase`. Elles sont
+  déclarées dans `PLANNED_COMMANDS`, l'état réserve déjà `tags` et `stash`, et le graphe sait
+  afficher des étiquettes de tag. Pour en ajouter une : écrire la fonction dans `engine.js` (ou
+  `remote.js`), puis la déclarer dans le registre `GIT` de `parser.js`.
 
 ## Scénario de test (10 commandes)
 
@@ -105,3 +121,30 @@ Résultat attendu :
 Pour aller plus loin : `git log --oneline --graph --all` dessine le même historique en ASCII,
 comme le vrai Git ; le bouton « Annuler » retire le commit de fusion et l'étiquette `main` revient
 en glissant sur « Correctif sur main ».
+
+## Scénario de test : travail en équipe avec le dépôt distant
+
+Ce scénario suit le « workflow fondamental » d'un cours Git classique : cloner, créer une branche
+de fonctionnalité, la pousser, faire accepter la merge request, puis mettre `main` à jour.
+
+```bash
+git clone https://github.com/camille/demo.git
+git switch -c feat/contact
+echo "Page contact" > contact.txt
+git add .
+git commit -m "Ajoute la page contact"
+git push -u origin feat/contact
+mr feat/contact
+git switch main
+git pull
+git log --oneline --graph --all
+```
+
+Résultat attendu : `git push -u` affiche ` * [new branch]      feat/contact -> feat/contact` puis
+`branch 'feat/contact' set up to track 'origin/feat/contact'.` ; après `mr`, la zone 4 du panneau
+signale des nouveautés sur `main` ; `git pull` récupère le commit de fusion
+(`Merge branch 'feat/contact' into 'main'`) en avance rapide. Dans le graphe, `main` et
+`origin/main` pointent sur ce commit de fusion, qui reçoit un trait vert depuis `feat/contact`.
+
+Pour provoquer un push refusé : `collab`, puis un commit local, puis `git push` (« rejected …
+fetch first ») ; `git pull --no-rebase` fusionne, et `git push` passe.

@@ -47,9 +47,9 @@
       </section>
     </main>
 
-    <aside class="panel" id="panel" data-panel aria-label="Les trois zones de Git" hidden>
+    <aside class="panel" id="panel" data-panel aria-label="Les zones de Git" hidden>
       <div class="panel-head">
-        <h2>Les trois zones de Git</h2>
+        <h2>Les zones de Git</h2>
         <button type="button" class="btn btn-icon" data-action="close-panel" aria-label="Fermer le panneau">✕</button>
       </div>
       <section class="zone zone-workdir">
@@ -68,6 +68,12 @@
         <h3><span class="zone-num">3</span> Dépôt local <small>(.git)</small></h3>
         <p class="zone-hint">L'historique enregistré : commits et branches.</p>
         <div data-zone="repo"></div>
+      </section>
+      <p class="zone-arrow"><code>git push</code> ↓ · ↑ <code>git fetch</code> / <code>git pull</code></p>
+      <section class="zone zone-remote">
+        <h3><span class="zone-num">4</span> Dépôt distant <small>(GitHub, GitLab…)</small></h3>
+        <p class="zone-hint">Ce que contient la forge, partagé avec l'équipe.</p>
+        <div data-zone="remote"></div>
       </section>
     </aside>
   </div>
@@ -102,9 +108,26 @@
           <li><code>git branch</code>, <code>git branch nom</code>, <code>git branch -d nom</code></li>
           <li><code>git checkout nom</code>, <code>git checkout -b nom</code>, <code>git switch nom</code>, <code>git switch -c nom</code></li>
           <li><code>git merge nom</code> (avance rapide, commit de fusion, conflits, <code>--abort</code>)</li>
+          <li><code>git config --global user.name "Prénom Nom"</code>, <code>user.email</code>, <code>git config --list</code></li>
           <li><code>git help</code> et <code>git help &lt;commande&gt;</code> ; <code>help</code> pour l'aide en français</li>
         </ul>
-        <p class="help-note">reset, revert, cherry-pick, stash, tag, rebase et remote sont prévus dans une prochaine version.</p>
+        <p class="help-note">reset, revert, cherry-pick, stash, tag et rebase sont prévus dans une prochaine version.</p>
+      </section>
+      <section>
+        <h3>Travailler avec un dépôt distant</h3>
+        <p>Le simulateur contient une forge (GitHub, GitLab…) simulée. Un dépôt de démonstration vous attend :
+          dans un dossier vide, tapez <code>git clone https://github.com/camille/demo.git</code>.
+          Toute autre adresse passée à <code>git remote add</code> crée un dépôt distant vide, comme un nouveau projet.</p>
+        <ul class="help-list">
+          <li><code>git remote -v</code>, <code>git remote add origin &lt;url&gt;</code>, <code>git remote remove origin</code></li>
+          <li><code>git push -u origin main</code> la première fois, puis <code>git push</code> ; <code>git push origin --delete nom</code></li>
+          <li><code>git fetch</code> télécharge sans fusionner ; <code>git pull</code> = fetch + merge (<code>--no-rebase</code>, <code>--ff-only</code>)</li>
+          <li><code>git branch -a</code>, <code>git branch -vv</code> (branche suivie, avance et retard), <code>git checkout nom</code> crée la branche qui suit <code>origin/nom</code></li>
+          <li><code>collab [branche] [fichier]</code> : Camille, une collègue simulée, pousse un commit sur le dépôt distant.</li>
+          <li><code>mr &lt;branche&gt; [cible]</code> : votre merge request (pull request) est acceptée sur la forge, avec un commit de fusion.</li>
+        </ul>
+        <p class="help-note">Dans le graphe, les étiquettes en pointillé (<code>origin/main</code>…) sont les branches de suivi :
+          la dernière image connue du dépôt distant, mise à jour par fetch, pull et push.</p>
       </section>
       <section>
         <h3>Lire le graphe</h3>
@@ -112,7 +135,7 @@
           <li>Le temps va de gauche à droite ; un commit de fusion a un point central et deux traits entrants.</li>
           <li>Les étiquettes colorées sont les branches ; l'étiquette blanche <strong>HEAD</strong> indique où vous êtes.</li>
           <li>Survolez un commit pour voir son hash, son message et son auteur ; cliquez dessus pour insérer son hash dans le terminal.</li>
-          <li>Le bouton « Zones Git » ouvre le panneau des trois zones : répertoire de travail, staging area et dépôt local.</li>
+          <li>Le bouton « Zones Git » ouvre le panneau des zones : répertoire de travail, staging area, dépôt local et dépôt distant.</li>
         </ul>
       </section>
       <section>
@@ -130,6 +153,9 @@ echo "Mon projet" &gt; README.md
 git add README.md
 git commit -m "Premier commit"
 git switch -c feature</pre>
+        <p class="help-note">Ou, côté travail en équipe : <code>git clone https://github.com/camille/demo.git</code>,
+          puis <code>git switch -c feat/ma-fonctionnalite</code>, commits, <code>git push -u origin feat/ma-fonctionnalite</code>,
+          <code>mr feat/ma-fonctionnalite</code>, et enfin <code>git switch main</code> + <code>git pull</code>.</p>
       </section>
     </div>
   </dialog>

@@ -11,6 +11,8 @@ import {
   reachableCommits,
   serialize,
   subject,
+  trackingInfo,
+  DEMO_URL,
 } from './engine.js';
 import { execute, getCompletions, promptInfo } from './parser.js';
 import { branchColor, createGraph } from './graph.js';
@@ -54,7 +56,12 @@ const ui = {
   panelButton: $('[data-action="panel"]'),
   undoButton: $('[data-action="undo"]'),
   help: $('[data-help]'),
-  zones: { workdir: $('[data-zone="workdir"]'), index: $('[data-zone="index"]'), repo: $('[data-zone="repo"]') },
+  zones: {
+    workdir: $('[data-zone="workdir"]'),
+    index: $('[data-zone="index"]'),
+    repo: $('[data-zone="repo"]'),
+    remote: $('[data-zone="remote"]'),
+  },
 };
 
 const terminal = createTerminal($('[data-terminal]'), {
@@ -140,7 +147,7 @@ function welcome(restored) {
   terminal.notice(
     restored
       ? 'Votre session précédente a été restaurée. Tapez help pour la liste des commandes.'
-      : 'Tapez vos commandes ci-dessous : commencez par git init, ou tapez help pour la liste des commandes.',
+      : `Tapez vos commandes ci-dessous : commencez par git init, ou clonez le dépôt de démonstration (git clone ${DEMO_URL}). Tapez help pour la liste des commandes.`,
   );
 }
 
@@ -246,6 +253,7 @@ function renderRepo() {
         h('span', { className: 'branch-name', textContent: name }),
         h('code', { textContent: id }),
         h('span', { className: 'branch-msg', textContent: subject(repo.commits[id]) }),
+        trackingTag(repo, name),
       );
     });
   const total = Object.keys(repo.commits).length;
@@ -268,11 +276,75 @@ function renderRepo() {
   );
 }
 
+/** Avance (↑ à pousser) et retard (↓ à récupérer) d'une branche sur la branche distante qu'elle suit. */
+function trackingTag(repo, name) {
+  const info = trackingInfo(repo, name);
+  if (!info) return null;
+  if (info.gone) return tag('distante supprimée', 'warn');
+  if (!info.ahead && !info.behind) return tag(`= ${info.upstream}`, 'muted');
+  const parts = [info.ahead && `↑${info.ahead}`, info.behind && `↓${info.behind}`].filter(Boolean).join(' ');
+  return tag(`${parts} ${info.upstream}`, info.behind ? 'warn' : 'ok');
+}
+
+function renderRemote() {
+  const repo = state.repo;
+  const names = repo ? Object.keys(repo.remotes).sort() : [];
+  if (!names.length) {
+    return ui.zones.remote.replaceChildren(
+      placeholder(
+        repo
+          ? 'Aucun dépôt distant : git remote add origin <url>.'
+          : `Pour essayer, dans un dossier vide : git clone ${DEMO_URL}`,
+      ),
+    );
+  }
+  const blocks = names.flatMap((name) => {
+    const url = repo.remotes[name].url;
+    const server = state.servers[url];
+    const branches = Object.keys(server.branches).sort();
+    const rows = branches.map((branch) => {
+      const id = server.branches[branch];
+      const known = repo.remoteRefs[`${name}/${branch}`];
+      const dot = h('span', { className: 'dot' });
+      dot.style.background = branchColor(repo, branch);
+      const freshness =
+        known === id ? tag('à jour', 'muted') : tag(known ? 'nouveautés : git fetch' : 'inconnue : git fetch', 'warn');
+      return h(
+        'li',
+        { className: 'branch' },
+        dot,
+        h('span', { className: 'branch-name', textContent: branch }),
+        h('code', { textContent: id }),
+        h('span', { className: 'branch-msg', textContent: subject(server.commits[id]) }),
+        freshness,
+      );
+    });
+    return [
+      h(
+        'p',
+        { className: 'repo-head' },
+        h('strong', { textContent: name }),
+        ' ',
+        h('span', { className: 'remote-url', textContent: url }),
+      ),
+      rows.length
+        ? h('ul', { className: 'branch-list' }, rows)
+        : placeholder("Dépôt vide : rien n'a encore été poussé."),
+      h('p', {
+        className: 'zone-foot',
+        textContent: `${plural(Object.keys(server.commits).length, 'commit')} sur la forge.`,
+      }),
+    ];
+  });
+  ui.zones.remote.replaceChildren(...blocks);
+}
+
 function renderPanel() {
   const status = state.repo ? computeStatus(state) : null;
   renderWorkdir(status);
   renderIndex(status);
   renderRepo();
+  renderRemote();
 }
 
 function setPanelOpen(open) {
